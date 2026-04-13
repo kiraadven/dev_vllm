@@ -33,7 +33,6 @@ import os
 from time import sleep
 
 from vllm import LLM, EngineArgs, SamplingParams
-from vllm.platforms import current_platform
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.network_utils import get_open_port
 
@@ -44,8 +43,11 @@ def create_parser():
     # Add all engine args
     EngineArgs.add_cli_args(parser)
     parser.set_defaults(
-        model="ibm-research/PowerMoE-3b",
+        model="/data/yqn/Qwen1.5-MoE-A2.7B",
         enable_expert_parallel=True,
+        enforce_eager=True,
+        data_parallel_size=1,
+        tensor_parallel_size=1,
     )
 
     # Add DP-specific args (separate from engine args to avoid conflicts)
@@ -76,10 +78,9 @@ def create_parser():
     parser.add_argument(
         "--timeout",
         type=int,
-        default=300,
+        default=600,
         help="Number of seconds before unresponsive process is killed.",
     )
-
     return parser
 
 
@@ -91,6 +92,8 @@ def main(
     dp_master_port,
     engine_args,
 ):
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
     os.environ["VLLM_DP_RANK"] = str(global_dp_rank)
     os.environ["VLLM_DP_RANK_LOCAL"] = str(local_dp_rank)
     os.environ["VLLM_DP_SIZE"] = str(dp_size)
@@ -177,18 +180,17 @@ if __name__ == "__main__":
     assert dp_size % dp_num_nodes == 0, "dp_size should be divisible by dp_num_nodes"
     dp_per_node = dp_size // dp_num_nodes
 
-    from multiprocessing import Process
+    from multiprocessing import get_context
 
-    if current_platform.is_rocm():
-        from multiprocessing import set_start_method
-
-        set_start_method("spawn", force=True)
+    # This launcher spawns DP processes that each create vLLM worker
+    # subprocesses. Using "spawn" avoids fork-related CUDA init hangs.
+    mp_ctx = get_context("spawn")
 
     procs = []
     for local_dp_rank, global_dp_rank in enumerate(
         range(dp_node_rank * dp_per_node, (dp_node_rank + 1) * dp_per_node)
     ):
-        proc = Process(
+        proc = mp_ctx.Process(
             target=main,
             args=(
                 dp_size,
