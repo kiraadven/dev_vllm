@@ -125,9 +125,9 @@ class DPCoordinator:
             back_publish_address,
         ) = self._wait_for_zmq_addrs(parent_zmq_addr_pipe)
 
-        self.stats_publish_address = front_publish_address
-        self.coord_in_address = back_publish_address
-        self.coord_out_address = back_output_address
+        self.stats_publish_address = front_publish_address # XPUB socket for publishing stats to front-ends
+        self.coord_in_address = back_publish_address # XPUB socket for sending control messages to engines
+        self.coord_out_address = back_output_address # PULL socket for receiving messages from engines
         self._finalizer = weakref.finalize(self, shutdown, [self.proc])
 
     def get_stats_publish_address(self) -> str:
