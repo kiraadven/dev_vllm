@@ -9,7 +9,7 @@ echo "🚧🚧 Warning: The usage of disaggregated prefill is experimental and s
 sleep 1
 
 # meta-llama/Meta-Llama-3.1-8B-Instruct or deepseek-ai/DeepSeek-V2-Lite
-MODEL_NAME=${HF_MODEL_NAME:-meta-llama/Meta-Llama-3.1-8B-Instruct}
+MODEL_NAME=${HF_MODEL_NAME:-/data/yqn/}
 
 # Trap the SIGINT signal (triggered by Ctrl+C)
 trap 'cleanup' INT
@@ -39,7 +39,7 @@ if python3 -c "import quart" &> /dev/null; then
 else
     echo "Quart is not installed. Installing..."
     python3 -m pip install quart
-fi 
+fi
 
 # a function that waits vLLM server to start
 wait_for_server() {
@@ -63,7 +63,7 @@ CUDA_VISIBLE_DEVICES=0 vllm serve "$MODEL_NAME" \
     --kv-transfer-config \
     '{"kv_connector":"P2pNcclConnector","kv_role":"kv_producer","kv_rank":0,"kv_parallel_size":2,"kv_buffer_size":"1e9","kv_port":"14579","kv_connector_extra_config":{"proxy_ip":"'"$VLLM_HOST_IP"'","proxy_port":"30001","http_ip":"'"$VLLM_HOST_IP"'","http_port":"8100","send_type":"PUT_ASYNC"}}' &
 
-# decoding instance, which is the KV consumer  
+# decoding instance, which is the KV consumer
 CUDA_VISIBLE_DEVICES=1 vllm serve "$MODEL_NAME" \
     --host 0.0.0.0 \
     --port 8200 \
@@ -79,11 +79,11 @@ wait_for_server 8200
 
 # launch a proxy server that opens the service at port 8000
 # the workflow of this proxy:
-# - send the request to prefill vLLM instance (port 8100), change max_tokens 
+# - send the request to prefill vLLM instance (port 8100), change max_tokens
 #   to 1
-# - after the prefill vLLM finishes prefill, send the request to decode vLLM 
+# - after the prefill vLLM finishes prefill, send the request to decode vLLM
 #   instance
-# NOTE: the usage of this API is subject to change --- in the future we will 
+# NOTE: the usage of this API is subject to change --- in the future we will
 # introduce "vllm connect" to connect between prefill and decode instances
 python3 ../../benchmarks/disagg_benchmarks/disagg_prefill_proxy_server.py &
 sleep 1
