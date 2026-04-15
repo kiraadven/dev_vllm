@@ -1,25 +1,69 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""
+Input:
+- Trace CSV(s): arrive_time,input_tokens_length,output_tokens_length (offline mode ignores arrive_time)
+- Model path (--model) with config.json; max_model_len is auto-read from config.json
+- Device/PD args (--data-parallel-size, --pd-ratio, ...)
+
+Output:
+- Per-trace assignment csv: <trace-output-root>/<trace_name>/dispatch_requests.csv
+- Optional one nsys report per trace: <nsys-output>_<trace_name>.nsys-rep (+ sqlite if enabled)
+
+Usage:
+- Run all traces: /root/vllm/.venv/bin/python offline_round_robin_dispatch.py --data-parallel-size 4 --pd-ratio 1:1
+- Run one trace:  /root/vllm/.venv/bin/python offline_round_robin_dispatch.py --trace-file traces/sharegpt_x/sharegpt_x_rate1p0.csv
+"""
+
+from __future__ import annotations
+
+import csv
+import json
 import os
 import re
-from time import sleep
-import time, csv
-from multiprocessing import Event, Process
+import subprocess
+import sys
+import traceback
+from dataclasses import dataclass
+from multiprocessing import get_context
+from pathlib import Path
 
-from vllm import LLM, EngineArgs, SamplingParams
+from vllm import EngineArgs, LLM, SamplingParams
+from vllm.config import KVTransferConfig, ProfilerConfig
+from vllm.logger import init_logger
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.network_utils import get_open_port
-from vllm.logger import init_logger
-from vllm.config import KVTransferConfig
 
 logger = init_logger(__name__)
 
-def create_parser():
-    parser = FlexibleArgumentParser(
-        description="Data Parallel Inference with Disaggregated Prefill"
-    )
 
-    # Add all engine args
+@dataclass(frozen=True)
+class TraceRequest:
+    """One request row from trace csv."""
+
+    trace_name: str
+    request_id: int
+    input_tokens: int
+    output_tokens: int
+    in_str: str
+    out_str: str
+
+
+@dataclass(frozen=True)
+class CommonRunConfig:
+    """Shared runtime config passed to worker processes."""
+
+    timeout: int
+    model: str
+    max_model_len: int
+    gpu_memory_utilization: float
+    enable_expert_parallel: bool
+    enforce_eager: bool
+
+
+def create_parser() -> FlexibleArgumentParser:
+    """Create CLI parser for offline trace execution and optional nsys mode."""
+    parser = FlexibleArgumentParser(description="Offline disaggregated prefill/decode")
     EngineArgs.add_cli_args(parser)
     parser.set_defaults(
         model="/data/yqn/Qwen1.5-MoE-A2.7B",
@@ -29,340 +73,473 @@ def create_parser():
         tensor_parallel_size=1,
     )
 
-    # Add DP-specific args (separate from engine args to avoid conflicts)
-    parser.add_argument(
-        "--dp-num-nodes",
-        type=int,
-        default=1,
-        help="Total number of nodes for data parallel.",
-    )
-    parser.add_argument(
-        "--dp-node-rank",
-        type=int,
-        default=0,
-        help="Rank of the current node for data parallel.",
-    )
-    parser.add_argument(
-        "--dp-master-addr",
-        type=str,
-        default="",
-        help="Master node IP address for DP coordination.",
-    )
-    parser.add_argument(
-        "--dp-master-port",
-        type=int,
-        default=0,
-        help="Master node port for DP coordination.",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=int,
-        default=600,
-        help="Number of seconds before unresponsive process is killed.",
-    )
+    for name, t, default in (
+        ("--timeout", int, 600),
+        ("--pd-ratio", str, "1:1"),
+        ("--trace-dir", str, "/root/vllm/yqn/traces/sharegpt_x"),
+        ("--trace-glob", str, "sharegpt_x_rate*.csv"),
+        ("--trace-file", str, ""),
+        ("--trace-output-root", str, "stats/offline_round_robin/by_trace"),
+        ("--nsys-profile-output", str, ""),
+    ):
+        parser.add_argument(name, type=t, default=default)
 
-    # PD placement args.
-    parser.add_argument(
-        "--pd-ratio",
-        type=str,
-        default="1:1",
-        help=(
-            "Prefill:Decode ratio used to assign DP ranks automatically, "
-            "e.g. 1:1, 1:2, 2/3."
-        ),
-    )
-    # parser.add_argument(
-    #     "--prefill-select-strategy",
-    #     type=str,
-    #     choices=["round_robin"],
-    #     default="round_robin",
-    #     help=(
-    #         "How a decode rank selects its prefill rank. "
-    #         "Currently only round_robin is supported."
-    #     ),
-    # )
+    parser.add_argument("--nsys-export-sqlite", action="store_true")
     return parser
 
 
-def parse_pd_ratio(pd_ratio: str) -> tuple[int, int]:
-    """Parse a ratio string like '1:2' into (1, 2)."""
-    match = re.fullmatch(r"\s*(\d+)\s*[:/xX]\s*(\d+)\s*", pd_ratio)
-    if match is None:
-        raise ValueError(
-            f"Invalid --pd-ratio={pd_ratio!r}. Use formats like 1:1, 1:2, 2/3."
-        )
-
-    prefill_weight = int(match.group(1))
-    decode_weight = int(match.group(2))
-    if prefill_weight <= 0 or decode_weight <= 0:
-        raise ValueError(
-            f"Invalid --pd-ratio={pd_ratio!r}. Both sides must be > 0."
-        )
-
-    return prefill_weight, decode_weight
-
-
 def build_pd_rank_plan(dp_size: int, pd_ratio: str) -> tuple[list[int], list[int]]:
-    """
-    Build rank roles from pd ratio.
+    """Convert pd_ratio to prefill/decode GPU index lists."""
+    m = re.fullmatch(r"\s*(\d+)\s*[:/xX]\s*(\d+)\s*", pd_ratio)
+    if not m:
+        raise ValueError(f"Invalid --pd-ratio={pd_ratio!r}")
+    pw, dw = int(m.group(1)), int(m.group(2))
+    if pw <= 0 or dw <= 0 or dp_size <= 0:
+        raise ValueError("pd_ratio and dp_size must be positive")
 
-    Example:
-        dp_size=4, pd_ratio=1:1 -> prefill=[0,2], decode=[1,3]
-        dp_size=6, pd_ratio=1:2 -> prefill=[0,3], decode=[1,2,4,5]
-    """
-    if dp_size <= 0:
-        raise ValueError(f"dp_size must be > 0, got {dp_size}.")
-
-    prefill_weight, decode_weight = parse_pd_ratio(pd_ratio)
-    pattern = ["P"] * prefill_weight + ["D"] * decode_weight
-
-    prefill_ranks: list[int] = []
-    decode_ranks: list[int] = []
-
-    for global_rank in range(dp_size):
-        if pattern[global_rank % len(pattern)] == "P":
-            prefill_ranks.append(global_rank)
-        else:
-            decode_ranks.append(global_rank)
-
-    prefill_ranks.sort()
-    decode_ranks.sort()
-    return prefill_ranks, decode_ranks
+    pattern = ["P"] * pw + ["D"] * dw
+    prefill, decode = [], []
+    for rank in range(dp_size):
+        (prefill if pattern[rank % len(pattern)] == "P" else decode).append(rank)
+    return prefill, decode
 
 
-def select_decode_rank_for_prefill(
-    prefill_rank: int,
-    decode_ranks: list[int],
-    strategy: str = "round_robin",
-) -> int:
-    if not decode_ranks:
-        raise ValueError("decode_ranks is empty; cannot select decode rank.")
+def build_1p1d_pairs(
+    prefill_gpus: list[int], decode_gpus: list[int]
+) -> list[tuple[int, int]]:
+    """Build one-to-one prefill/decode GPU pairs."""
+    if len(prefill_gpus) != len(decode_gpus):
+        raise ValueError(
+            "This script runs independent 1P1D pairs, so prefill/decode counts "
+            f"must match. Got prefill={len(prefill_gpus)} decode={len(decode_gpus)}. "
+            "Use --pd-ratio 1:1 with an even --data-parallel-size."
+        )
+    return list(zip(prefill_gpus, decode_gpus, strict=True))
 
-    if strategy == "round_robin":
-        return decode_ranks[prefill_rank % len(decode_ranks)]
 
-    raise ValueError(f"Unsupported --prefill-select-strategy={strategy!r}")
+def allocate_pair_ports(pair_count: int) -> list[tuple[int, int]]:
+    """Allocate dedicated (prefill_port, decode_port) for each pair."""
+    if pair_count <= 0:
+        return []
 
-def run_prefill(prefill_done, prefill_rank, prompts):
-    # We use GPU 0 for prefill node.
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(prefill_rank)
+    used: set[int] = set()
+    ports: list[tuple[int, int]] = []
+    for _ in range(pair_count):
+        prefill_port = get_open_port()
+        while prefill_port in used:
+            prefill_port = get_open_port()
+        used.add(prefill_port)
 
-    sampling_params = SamplingParams(temperature=0, top_p=0.95, max_tokens=1)
+        decode_port = get_open_port()
+        while decode_port in used:
+            decode_port = get_open_port()
+        used.add(decode_port)
 
-    # Using P2pNcclConnector to transmit KV caches between vLLM instances.
-    # This instance is the prefill node (kv_producer, rank 0).
-    # The number of parallel instances for KV cache transfer is set to 2,
-    # as required for P2pNcclConnector.
-    ktc = KVTransferConfig(
-        kv_connector="P2pNcclConnector",
-        kv_role="kv_producer",
-        kv_rank=prefill_rank,
-        kv_parallel_size=2,
+        ports.append((prefill_port, decode_port))
+    return ports
+
+
+def resolve_max_model_len_from_config(model: str) -> int:
+    """Read max_model_len from <model>/config.json."""
+    cfg_path = Path(model).expanduser() / "config.json"
+    if not cfg_path.is_file():
+        raise FileNotFoundError(f"Cannot find config.json: {cfg_path}")
+
+    with open(cfg_path, encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    candidate_keys = (
+            "max_model_len",
+            "model_max_length",
+            "max_position_embeddings",
+            "seq_length",
+            "n_positions",
+            "n_ctx",
     )
-
-    # Set GPU memory utilization to 0.8 for an A6000 GPU with 40GB
-    # memory. You may need to adjust the value to fit your GPU.
-    llm = LLM(
-        model="meta-llama/Meta-Llama-3.1-8B-Instruct",
-        kv_transfer_config=ktc,
-        max_model_len=2000,
-        gpu_memory_utilization=0.8,
-    )
-
-    llm.generate(prompts, sampling_params)
-    logger.info("Prefill node is finished for rank %d.", prefill_rank)
-    prefill_done.set()
-
-    # To keep the prefill node running in case the decode node is not done;
-    # otherwise, the script might exit prematurely, causing incomplete decoding.
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("Script stopped by user.")
+    for key in candidate_keys:
+        val = cfg.get(key)
+        if isinstance(val, int) and 0 < val < 10_000_000:
+            return val
+        if isinstance(val, float) and val.is_integer() and 0 < val < 10_000_000:
+            return int(val)
+    raise ValueError(f"No max length key in {cfg_path}")
 
 
-def run_decode(prefill_done, decode_rank):
-    # We use the specified GPU for the decode node.
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(decode_rank)
-    sampling_params = SamplingParams(temperature=0, top_p=0.95)
-
-    # Using P2pNcclConnector to transmit KV caches between vLLM instances.
-    # This instance is the decode node (kv_consumer, rank 1).
-    # The number of parallel instances for KV cache transfer is set to 2,
-    # as required for P2pNcclConnector.
-    ktc = KVTransferConfig(
-        kv_connector="P2pNcclConnector",
-        kv_role="kv_consumer",
-        kv_rank=decode_rank,
-        kv_parallel_size=2,
-    )
-
-    # Set GPU memory utilization to 0.8 for an A6000 GPU with 40GB
-    # memory. You may need to adjust the value to fit your GPU.
-    llm = LLM(
-        model="meta-llama/Meta-Llama-3.1-8B-Instruct",
-        kv_transfer_config=ktc,
-        max_model_len=2000,
-        gpu_memory_utilization=0.8,
-    )
-
-    # Wait for the producer to start the pipe
-    logger.info("Waiting for prefill node to finish...,rank %d", decode_rank)
-    prefill_done.wait()
-
-    # At this point when the prefill_done is set, the kv-cache should have been
-    # transferred to this decode node, so we can start decoding.
-    outputs = llm.generate(prompts, sampling_params)
-    for output in outputs:
-        prompt = output.prompt
-        generated_text = output.outputs[0].text
-        print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
+def load_trace_requests(trace_path: Path) -> list[TraceRequest]:
+    """Load one trace csv in original row order (no sorting)."""
+    requests: list[TraceRequest] = []
+    with open(trace_path, newline="", encoding="utf-8") as f:
+        for request_id, row in enumerate(csv.DictReader(f)):
+            in_tok = int(row["input_tokens_length"])
+            out_tok = int(row["output_tokens_length"])
+            requests.append(
+                TraceRequest(
+                    trace_name=trace_path.stem,
+                    request_id=request_id,
+                    input_tokens=in_tok,
+                    output_tokens=out_tok,
+                    in_str="hi" * max(1, in_tok),
+                    out_str="hi" * max(1, out_tok),
+                )
+            )
+    if not requests:
+        raise ValueError(f"Trace is empty: {trace_path}")
+    return requests
 
 
-def main(
-    prompts,
-    dp_size,
-    local_dp_rank,
-    global_dp_rank,
-    dp_master_ip,
-    dp_master_port,
-    engine_args,
-    p_rank,
-    d_rank,
-):
+def dispatch_round_robin(
+    requests: list[TraceRequest], prefill_gpus: list[int]
+) -> dict[int, list[TraceRequest]]:
+    """Round-robin assign requests to prefill GPUs."""
+    if not prefill_gpus:
+        raise ValueError("prefill_gpus is empty")
+    assigned = {gpu: [] for gpu in prefill_gpus}
+    for i, req in enumerate(requests):
+        assigned[prefill_gpus[i % len(prefill_gpus)]].append(req)
+    return assigned
+
+
+def write_dispatch_csv(
+    trace_output_root: Path,
+    trace_name: str,
+    assignments: dict[int, list[TraceRequest]],
+) -> None:
+    """Persist per-trace request assignment result to csv."""
+    out_dir = trace_output_root / trace_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_csv = out_dir / "dispatch_requests.csv"
+    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "trace_name",
+                "prefill_rank",
+                "request_id",
+                "input_tokens",
+                "output_tokens",
+            ],
+        )
+        writer.writeheader()
+        for prefill_gpu, reqs in assignments.items():
+            for req in reqs:
+                writer.writerow(
+                    {
+                        "trace_name": req.trace_name,
+                        "prefill_rank": prefill_gpu,
+                        "request_id": req.request_id,
+                        "input_tokens": req.input_tokens,
+                        "output_tokens": req.output_tokens,
+                    }
+                )
+
+
+def set_worker_env(visible_device: int) -> None:
+    """Apply per-worker process environment."""
     os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-
-    os.environ["VLLM_DP_RANK"] = str(global_dp_rank)
-    os.environ["VLLM_DP_RANK_LOCAL"] = str(local_dp_rank)
-    os.environ["VLLM_DP_SIZE"] = str(dp_size)
-    os.environ["VLLM_DP_MASTER_IP"] = dp_master_ip
-    os.environ["VLLM_DP_MASTER_PORT"] = str(dp_master_port)
-
-    # With DP, each rank should process different prompts.
-    floor = len(prompts) // dp_size
-    remainder = len(prompts) % dp_size
-
-    def start(rank: int) -> int:
-        return rank * floor + min(rank, remainder)
-
-    prompts = prompts[start(global_dp_rank):start(global_dp_rank + 1)]
-    if len(prompts) == 0:
-        prompts = ["Placeholder"]
-
-    logger.info(f"DP rank {global_dp_rank} needs to process {len(prompts)} prompts")
-
-    prefill_done = Event()
-    prefill_process = Process(target=run_prefill, args=(prefill_done, p_rank, prompts))
-    decode_process = Process(target=run_decode, args=(prefill_done, d_rank))
-
-    # Start prefill node
-    prefill_process.start()
-
-    # Start decode node
-    decode_process.start()
-
-    # Terminate the prefill node when decode is finished
-    decode_process.join()
-    prefill_process.terminate()
-
-    # Give engines time to pause their processing loops before exiting.
-    sleep(1)
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(visible_device)
 
 
-if __name__ == "__main__":
+def run_prefill_worker(
+    prefill_ready,
+    shutdown_event,
+    prompts: list[str],
+    prefill_gpu: int,
+    kv_port: int,
+    pair_idx: int,
+    cfg: CommonRunConfig,
+) -> None:
+    """Prefill process: run all prompts once, signal ready, wait shutdown event."""
+    try:
+        set_worker_env(prefill_gpu)
+        llm = LLM(
+            model=cfg.model,
+            kv_transfer_config=KVTransferConfig(
+                kv_connector="P2pNcclConnector",
+                kv_role="kv_producer",
+                kv_rank=0,
+                kv_parallel_size=2,
+                kv_port=kv_port,
+            ),
+            profiler_config=ProfilerConfig(
+                profiler="cuda",
+                delay_iterations=3,
+                max_iterations=10,
+            ),
+            enable_layerwise_nvtx_tracing=True,
+            enable_logging_iteration_details=True,
+            max_model_len=cfg.max_model_len,
+            gpu_memory_utilization=cfg.gpu_memory_utilization,
+            enable_expert_parallel=cfg.enable_expert_parallel,
+            enforce_eager=cfg.enforce_eager,
+            data_parallel_size=1,
+            tensor_parallel_size=1,
+        )
+        llm.generate(prompts, SamplingParams(temperature=0, top_p=0.95, max_tokens=1))
+        prefill_ready.set()
+        shutdown_event.wait()
+    except Exception:
+        logger.error(
+            "prefill pair=%d gpu=%d failed\n%s",
+            pair_idx,
+            prefill_gpu,
+            traceback.format_exc(),
+        )
+        prefill_ready.set()
+
+
+def run_decode_worker(
+    prefill_ready,
+    prompts: list[str],
+    decode_gpu: int,
+    kv_port: int,
+    pair_idx: int,
+    cfg: CommonRunConfig,
+) -> None:
+    """Decode process: initialize consumer, wait prefill, then decode."""
+    set_worker_env(decode_gpu)
+    llm = LLM(
+        model=cfg.model,
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="P2pNcclConnector",
+            kv_role="kv_consumer",
+            kv_rank=1,
+            kv_parallel_size=2,
+            kv_port=kv_port,
+        ),
+        profiler_config=ProfilerConfig(
+            profiler="cuda",
+            delay_iterations=3,
+            max_iterations=10,
+        ),
+        enable_layerwise_nvtx_tracing=True,
+        enable_logging_iteration_details=True,
+        max_model_len=cfg.max_model_len,
+        gpu_memory_utilization=cfg.gpu_memory_utilization,
+        enable_expert_parallel=cfg.enable_expert_parallel,
+        enforce_eager=cfg.enforce_eager,
+        data_parallel_size=1,
+        tensor_parallel_size=1,
+    )
+    if not prefill_ready.wait(timeout=cfg.timeout):
+        raise TimeoutError(
+            f"decode pair {pair_idx} (gpu {decode_gpu}) timed out waiting prefill"
+        )
+    llm.generate(prompts, SamplingParams(temperature=0, top_p=0.95))
+
+
+def run_single_trace(
+    requests: list[TraceRequest],
+    pair_gpus: list[tuple[int, int]],
+    pair_ports: list[tuple[int, int]],
+    cfg: CommonRunConfig,
+    trace_output_root: Path,
+) -> int:
+    """Run one trace end-to-end; after decode ends, shut down all prefill instances."""
+    prefill_gpus = [prefill_gpu for prefill_gpu, _ in pair_gpus]
+    assignments = dispatch_round_robin(requests, prefill_gpus)
+    write_dispatch_csv(trace_output_root, requests[0].trace_name, assignments)
+
+    mp_ctx = get_context("spawn")
+    pairs: list[dict[str, object]] = []
+
+    for pair_idx, ((prefill_gpu, decode_gpu), (prefill_port, decode_port)) in enumerate(
+        zip(pair_gpus, pair_ports, strict=True)
+    ):
+        in_str = [r.in_str for r in assignments[prefill_gpu]] or ["Placeholder"]
+        out_str = [r.out_str for r in assignments[prefill_gpu]] or ["Placeholder"]
+
+        prefill_ready = mp_ctx.Event()
+        shutdown_event = mp_ctx.Event()
+        prefill_proc = mp_ctx.Process(
+            target=run_prefill_worker,
+            args=(
+                prefill_ready,
+                shutdown_event,
+                in_str,
+                prefill_gpu,
+                prefill_port,
+                pair_idx,
+                cfg,
+            ),
+        )
+        decode_proc = mp_ctx.Process(
+            target=run_decode_worker,
+            args=(prefill_ready, out_str, decode_gpu, decode_port, pair_idx, cfg),
+        )
+
+        prefill_proc.start()
+        decode_proc.start()
+        pairs.append(
+            {
+                "pair_idx": pair_idx,
+                "prefill_gpu": prefill_gpu,
+                "decode_gpu": decode_gpu,
+                "prefill_proc": prefill_proc,
+                "decode_proc": decode_proc,
+                "shutdown_event": shutdown_event,
+            }
+        )
+
+    exit_code = 0
+    for pair in pairs:
+        decode_proc = pair["decode_proc"]
+        decode_proc.join(timeout=cfg.timeout)  # type: ignore[attr-defined]
+        if decode_proc.exitcode is None:  # type: ignore[attr-defined]
+            logger.error(
+                "decode timeout pair=%d p_gpu=%d->d_gpu=%d",
+                pair["pair_idx"],
+                pair["prefill_gpu"],
+                pair["decode_gpu"],
+            )
+            decode_proc.kill()  # type: ignore[attr-defined]
+            exit_code = 1
+        elif decode_proc.exitcode != 0:  # type: ignore[attr-defined]
+            logger.error(
+                "decode failed pair=%d p_gpu=%d->d_gpu=%d code=%s",
+                pair["pair_idx"],
+                pair["prefill_gpu"],
+                pair["decode_gpu"],
+                decode_proc.exitcode,
+            )
+            exit_code = int(decode_proc.exitcode)  # type: ignore[arg-type]
+
+        pair["shutdown_event"].set()  # type: ignore[attr-defined]
+        prefill_proc = pair["prefill_proc"]
+        prefill_proc.join(timeout=5)  # type: ignore[attr-defined]
+        if prefill_proc.is_alive():  # type: ignore[attr-defined]
+            prefill_proc.terminate()  # type: ignore[attr-defined]
+            prefill_proc.join(timeout=5)  # type: ignore[attr-defined]
+
+    return exit_code
+
+
+def launch_nsys_for_trace(trace_path: Path, output_base: Path, export_sqlite: bool) -> int:
+    """Launch one child run under nsys for a single trace and optionally export sqlite."""
+    per_trace_base = output_base.parent / f"{output_base.name}_{trace_path.stem}"
+    per_trace_base.parent.mkdir(parents=True, exist_ok=True)
+
+    child_argv: list[str] = []
+    skip_next = False
+    for token in sys.argv[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if token in {"--nsys-profile-output", "--trace-file"}:
+            skip_next = True
+            continue
+        if token == "--nsys-export-sqlite":
+            continue
+        child_argv.append(token)
+    child_argv.extend(["--trace-file", str(trace_path), "--nsys-profile-output", ""])
+
+    cmd = [
+        "nsys",
+        "profile",
+        "-t",
+        "cuda,osrt",
+        "--force-overwrite",
+        "true",
+        "-o",
+        str(per_trace_base),
+        sys.executable,
+        sys.argv[0],
+        *child_argv,
+    ]
+    env = os.environ.copy()
+    env["VLLM_RR_NSYS_CHILD"] = "1"
+    rc = subprocess.run(cmd, env=env).returncode
+    if rc != 0:
+        return rc
+
+    if export_sqlite:
+        rep_path = f"{per_trace_base}.nsys-rep"
+        export_cmd = [
+            "nsys",
+            "export",
+            "--type",
+            "sqlite",
+            "--force-overwrite",
+            "true",
+            "-o",
+            str(per_trace_base),
+            rep_path,
+        ]
+        rc = subprocess.run(export_cmd, env=env).returncode
+    return rc
+
+
+def main() -> int:
+    """Entry point: parse args, optional nsys mode, then run traces sequentially."""
     parser = create_parser()
     args = vars(parser.parse_args())
 
-    # Extract DP-specific args (pop to remove from engine_args)
-    dp_size = args.pop("data_parallel_size")
-    dp_num_nodes = args.pop("dp_num_nodes")
-    dp_node_rank = args.pop("dp_node_rank")
-    dp_master_addr = args.pop("dp_master_addr")
-    dp_master_port = args.pop("dp_master_port")
-    timeout = args.pop("timeout")
-    pd_ratio = args.pop("pd_ratio")
+    device_count = int(args.pop("data_parallel_size"))
+    timeout = int(args.pop("timeout"))
+    pd_ratio = str(args.pop("pd_ratio"))
 
-    # Remaining args are engine args
-    engine_args = args
+    trace_dir = Path(str(args.pop("trace_dir")))
+    trace_glob = str(args.pop("trace_glob"))
+    trace_file = str(args.pop("trace_file"))
+    trace_output_root = Path(str(args.pop("trace_output_root")))
+    nsys_profile_output = str(args.pop("nsys_profile_output"))
+    nsys_export_sqlite = bool(args.pop("nsys_export_sqlite"))
 
-    if dp_num_nodes == 1:
-        dp_master_ip = "127.0.0.1"
-        dp_master_port_val = get_open_port()
-    else:
-        dp_master_ip = dp_master_addr
-        dp_master_port_val = dp_master_port
+    prefill_gpus, decode_gpus = build_pd_rank_plan(device_count, pd_ratio)
+    pair_gpus = build_1p1d_pairs(prefill_gpus, decode_gpus)
 
-    assert dp_size % dp_num_nodes == 0, "dp_size should be divisible by dp_num_nodes"
-    dp_per_node = dp_size // dp_num_nodes
-
-    prefill_ranks, decode_ranks = build_pd_rank_plan(dp_size, pd_ratio)
-    prefill_to_decode = {
-        p_rank: select_decode_rank_for_prefill(
-            p_rank,
-            decode_ranks,
+    trace_paths = [Path(trace_file)] if trace_file else list(trace_dir.glob(trace_glob))
+    if not trace_paths:
+        raise FileNotFoundError(
+            "No trace files found from "
+            f"trace_dir={trace_dir} trace_glob={trace_glob} trace_file={trace_file}"
         )
-        for p_rank in prefill_ranks
-    }
+
+    if nsys_profile_output and os.environ.get("VLLM_RR_NSYS_CHILD") != "1":
+        out_base = Path(nsys_profile_output)
+        out_base.parent.mkdir(parents=True, exist_ok=True)
+        rc = 0
+        for trace_path in trace_paths:
+            rc = launch_nsys_for_trace(trace_path, out_base, nsys_export_sqlite)
+            if rc != 0:
+                break
+        return rc
+
+    model = str(args.get("model", "/data/yqn/Qwen1.5-MoE-A2.7B"))
+    cfg = CommonRunConfig(
+        timeout=timeout,
+        model=model,
+        max_model_len=resolve_max_model_len_from_config(model),
+        gpu_memory_utilization=float(args.get("gpu_memory_utilization", 0.8) or 0.8),
+        enable_expert_parallel=bool(args.get("enable_expert_parallel", True)),
+        enforce_eager=bool(args.get("enforce_eager", True)),
+    )
 
     logger.info(
-        f"PD ratio {pd_ratio} with dp_size={dp_size} => "
-        f"prefill_ranks={prefill_ranks}, decode_ranks={decode_ranks}"
+        "model=%s max_model_len=%d pd_ratio=%s pair_gpus=%s",
+        cfg.model,
+        cfg.max_model_len,
+        pd_ratio,
+        pair_gpus,
     )
-    logger.info(f"Prefill->Decode mapping: {prefill_to_decode}")
 
-    def load_trace(csv_path):
-      rows = []
-      with open(csv_path) as f:
-          for r in csv.DictReader(f):
-              rows.append((float(r["arrive_time"]), int(r["input_tokens_length"])))
-      rows.sort(key=lambda x: x[0])
-      t0 = rows[0][0]
-      return [(t - t0, n) for t, n in rows]  # 相对时间
-
-    def synth_prompt(n_tokens):
-        return "hello " * max(1, n_tokens)
-
-    trace = load_trace("vllm/yqn/traces/sharegpt_x/sharegpt_x_rate0p5.csv")
-
-    from multiprocessing import get_context
-
-    # This launcher spawns DP processes that each create vLLM worker
-    # subprocesses. Using "spawn" avoids fork-related CUDA init hangs.
-    mp_ctx = get_context("spawn")
-
-    procs = []
-    for local_dp_rank, global_dp_rank in enumerate(
-        range(dp_node_rank * dp_per_node, (dp_node_rank + 1) * dp_per_node)
-    ):
-        p_rank = prefill_ranks.index(global_dp_rank) if global_dp_rank in prefill_ranks else None
-        # FIXME: This selection logic is only for 1:1 ratio. We need a more general way to assign decode ranks to prefill ranks
-        d_rank = select_decode_rank_for_prefill(p_rank, decode_ranks) # type: ignore
-        proc = mp_ctx.Process(
-            target=main,
-            args=(
-                prompts,
-                dp_size,
-                local_dp_rank,
-                global_dp_rank,
-                dp_master_ip,
-                dp_master_port_val,
-                engine_args,
-                p_rank,
-                d_rank,
-            ),
+    final_exit_code = 0
+    for trace_path in trace_paths:
+        pair_ports = allocate_pair_ports(len(pair_gpus))
+        requests = load_trace_requests(trace_path)
+        logger.info(
+            "start trace=%s reqs=%d pair_ports=%s",
+            trace_path.stem,
+            len(requests),
+            pair_ports,
         )
-        proc.start()
-        procs.append(proc)
+        rc = run_single_trace(requests, pair_gpus, pair_ports, cfg, trace_output_root)
+        if rc != 0:
+            final_exit_code = rc
+            break
+        logger.info("done trace=%s; all instances shutdown", trace_path.stem)
 
-    exit_code = 0
-    for proc in procs:
-        proc.join(timeout=timeout)
-        if proc.exitcode is None:
-            print(f"Killing process {proc.pid} that didn't stop within 5 minutes.")
-            proc.kill()
-            exit_code = 1
-        elif proc.exitcode:
-            exit_code = proc.exitcode
+    return final_exit_code
 
-    exit(exit_code)
+
+if __name__ == "__main__":
+    raise SystemExit(main())
