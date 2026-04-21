@@ -28,8 +28,8 @@ def _bg_preload_torch() -> None:
         import torch  # noqa: F401
     except Exception:
         return
-    with contextlib.suppress(Exception):
-        import transformers  # noqa: F401
+    # with contextlib.suppress(Exception):
+    #     import transformers  # noqa: F401
 
 
 _threading.Thread(

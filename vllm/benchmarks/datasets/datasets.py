@@ -1285,8 +1285,8 @@ class RandomMultiModalDataset(RandomDataset):
 
 class ShareGPTDataset(BenchmarkDataset):
     """
-    Implements the ShareGPT dataset.  Loads data from a JSON file and generates
-    sample requests based on conversation turns.
+    Implements the ShareGPT dataset. Loads data from JSON or JSONL and
+    generates sample requests based on conversation turns.
     """
 
     def __init__(self, **kwargs) -> None:
@@ -1297,17 +1297,115 @@ class ShareGPTDataset(BenchmarkDataset):
         if self.dataset_path is None:
             raise ValueError("dataset_path must be provided for loading data.")
 
-        with open(self.dataset_path, encoding="utf-8") as f:
-            self.data = json.load(f)
-        # Filter entries with at least two conversation turns.
-        self.data = [
-            entry
-            for entry in self.data
-            if "conversations" in entry and len(entry["conversations"]) >= 2
-        ]
+        raw_entries = self._load_raw_entries()
+        self.data = []
+        for entry in raw_entries:
+            normalized_entry = self._normalize_sharegpt_entry(entry)
+            if normalized_entry is not None:
+                self.data.append(normalized_entry)
+
         random.seed(self.random_seed)
         if not getattr(self, "disable_shuffle", False):
             random.shuffle(self.data)
+
+    def _load_raw_entries(self) -> list[dict[str, Any]]:
+        if self.dataset_path is None:
+            raise ValueError("dataset_path must be provided for loading data.")
+
+        if self.dataset_path.endswith(".jsonl"):
+            raw_entries: list[dict[str, Any]] = []
+            with open(self.dataset_path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    entry = json.loads(line)
+                    if not isinstance(entry, dict):
+                        raise ValueError(
+                            "ShareGPT JSONL entries must be JSON objects."
+                        )
+                    raw_entries.append(entry)
+            return raw_entries
+
+        with open(self.dataset_path, encoding="utf-8") as f:
+            raw_entries = json.load(f)
+
+        if not isinstance(raw_entries, list):
+            raise ValueError("ShareGPT dataset must be a JSON array.")
+        if not all(isinstance(entry, dict) for entry in raw_entries):
+            raise ValueError("ShareGPT dataset entries must be JSON objects.")
+        return raw_entries
+
+    @staticmethod
+    def _extract_turn_role(turn: Mapping[str, Any]) -> str | None:
+        role = turn.get("from", turn.get("role"))
+        if isinstance(role, Mapping):
+            role = role.get("role") or role.get("name")
+        if not isinstance(role, str):
+            return None
+        role = role.strip().lower()
+        return role or None
+
+    @classmethod
+    def _flatten_turn_content(cls, content: Any) -> str:
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, Mapping):
+            return cls._flatten_turn_content(content.get("content"))
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                text = cls._flatten_turn_content(item)
+                if text:
+                    parts.append(text)
+            return " ".join(parts).strip()
+        return ""
+
+    @classmethod
+    def _extract_turn_text(cls, turn: Mapping[str, Any]) -> str:
+        for key in ("value", "content", "text"):
+            text = cls._flatten_turn_content(turn.get(key))
+            if text:
+                return text
+        return ""
+
+    @classmethod
+    def _normalize_sharegpt_entry(
+        cls, entry: Mapping[str, Any]
+    ) -> dict[str, Any] | None:
+        conversations = entry.get("conversations")
+        if not isinstance(conversations, list):
+            return None
+
+        for prompt_turn, completion_turn in zip(conversations, conversations[1:]):
+            if not isinstance(prompt_turn, Mapping) or not isinstance(
+                completion_turn, Mapping
+            ):
+                continue
+
+            prompt_role = cls._extract_turn_role(prompt_turn)
+            completion_role = cls._extract_turn_role(completion_turn)
+            if prompt_role not in {"human", "user"}:
+                continue
+            if completion_role not in {"gpt", "assistant"}:
+                continue
+
+            prompt = cls._extract_turn_text(prompt_turn)
+            completion = cls._extract_turn_text(completion_turn)
+            if not prompt or not completion:
+                continue
+
+            normalized_entry = {
+                "prompt": prompt,
+                "completion": completion,
+            }
+            if "image" in entry:
+                normalized_entry["image"] = entry["image"]
+            if "video" in entry:
+                normalized_entry["video"] = entry["video"]
+            return normalized_entry
+
+        return None
 
     def sample(
         self,
@@ -1327,10 +1425,8 @@ class ShareGPTDataset(BenchmarkDataset):
         for entry in self.data:
             if len(samples) >= num_requests:
                 break
-            prompt, completion = (
-                entry["conversations"][0]["value"],
-                entry["conversations"][1]["value"],
-            )
+            prompt = entry["prompt"]
+            completion = entry["completion"]
 
             lora_request = self.get_lora_request(
                 index=ind,
