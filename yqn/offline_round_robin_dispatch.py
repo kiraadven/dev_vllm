@@ -32,7 +32,7 @@ from vllm import EngineArgs, LLM, SamplingParams
 from vllm.config import KVTransferConfig, ProfilerConfig
 from vllm.logger import init_logger
 from vllm.utils.argparse_utils import FlexibleArgumentParser
-from vllm.utils.network_utils import get_open_port
+from vllm.utils.network_utils import get_ip, get_open_port
 
 logger = init_logger(__name__)
 
@@ -239,10 +239,28 @@ def set_worker_env(visible_device: int) -> None:
     os.environ["CUDA_VISIBLE_DEVICES"] = str(visible_device)
 
 
+def generate_with_request_ids(
+    llm: LLM,
+    prompts: list[str],
+    request_ids: list[str],
+    sampling_params: SamplingParams,
+) -> None:
+    """Submit prompts with explicit request ids and drive engine until done."""
+    if len(prompts) != len(request_ids):
+        raise ValueError("prompts and request_ids must have the same length")
+
+    for prompt, request_id in zip(prompts, request_ids, strict=True):
+        llm.llm_engine.add_request(request_id, prompt, sampling_params)
+
+    while llm.llm_engine.has_unfinished_requests():
+        llm.llm_engine.step()
+
+
 def run_prefill_worker(
     prefill_ready,
     shutdown_event,
     prompts: list[str],
+    request_ids: list[str],
     prefill_gpu: int,
     kv_port: int,
     pair_idx: int,
@@ -274,7 +292,12 @@ def run_prefill_worker(
             data_parallel_size=1,
             tensor_parallel_size=1,
         )
-        llm.generate(prompts, SamplingParams(temperature=0, top_p=0.95, max_tokens=1))
+        generate_with_request_ids(
+            llm,
+            prompts,
+            request_ids,
+            SamplingParams(temperature=0, top_p=0.95, max_tokens=1),
+        )
         prefill_ready.set()
         shutdown_event.wait()
     except Exception:
@@ -290,6 +313,7 @@ def run_prefill_worker(
 def run_decode_worker(
     prefill_ready,
     prompts: list[str],
+    request_ids: list[str],
     decode_gpu: int,
     kv_port: int,
     pair_idx: int,
@@ -324,7 +348,12 @@ def run_decode_worker(
         raise TimeoutError(
             f"decode pair {pair_idx} (gpu {decode_gpu}) timed out waiting prefill"
         )
-    llm.generate(prompts, SamplingParams(temperature=0, top_p=0.95))
+    generate_with_request_ids(
+        llm,
+        prompts,
+        request_ids,
+        SamplingParams(temperature=0, top_p=0.95),
+    )
 
 
 def run_single_trace(
@@ -341,12 +370,26 @@ def run_single_trace(
 
     mp_ctx = get_context("spawn")
     pairs: list[dict[str, object]] = []
+    local_ip = get_ip()
 
     for pair_idx, ((prefill_gpu, decode_gpu), (prefill_port, decode_port)) in enumerate(
         zip(pair_gpus, pair_ports, strict=True)
     ):
-        in_str = [r.in_str for r in assignments[prefill_gpu]] or ["Placeholder"]
-        out_str = [r.out_str for r in assignments[prefill_gpu]] or ["Placeholder"]
+        pair_reqs = assignments[prefill_gpu]
+        in_str = [r.in_str for r in pair_reqs] or ["Placeholder"]
+        out_str = [r.out_str for r in pair_reqs] or ["Placeholder"]
+        request_ids = [
+            (
+                f"___prefill_addr_{local_ip}:{prefill_port}"
+                f"___decode_addr_{local_ip}:{decode_port}_{r.request_id}"
+            )
+            for r in pair_reqs
+        ] or [
+            (
+                f"___prefill_addr_{local_ip}:{prefill_port}"
+                f"___decode_addr_{local_ip}:{decode_port}_placeholder"
+            )
+        ]
 
         prefill_ready = mp_ctx.Event()
         shutdown_event = mp_ctx.Event()
@@ -356,6 +399,7 @@ def run_single_trace(
                 prefill_ready,
                 shutdown_event,
                 in_str,
+                request_ids,
                 prefill_gpu,
                 prefill_port,
                 pair_idx,
@@ -364,7 +408,15 @@ def run_single_trace(
         )
         decode_proc = mp_ctx.Process(
             target=run_decode_worker,
-            args=(prefill_ready, out_str, decode_gpu, decode_port, pair_idx, cfg),
+            args=(
+                prefill_ready,
+                out_str,
+                request_ids,
+                decode_gpu,
+                decode_port,
+                pair_idx,
+                cfg,
+            ),
         )
 
         prefill_proc.start()

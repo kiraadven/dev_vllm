@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Online disaggregated P/D benchmark on a single node with 4 GPUs:
 # - 2 prefill instances + 2 decode instances (2 P/D pairs)
-# - Round-robin dispatch by trace CSV arrive_time
-# - 5 full measurement rounds (startup -> replay -> shutdown)
+# - Async trace replay against proxy servers
+# - For each trace: launch servers -> replay -> terminate
 
 set -euo pipefail
 
@@ -11,7 +11,8 @@ YQN_DIR="${ROOT_DIR}/yqn"
 PYTHON_BIN="${PYTHON_BIN:-${ROOT_DIR}/.venv/bin/python}"
 
 MODEL_NAME="${HF_MODEL_NAME:-/data/yqn/Qwen1.5-MoE-A2.7B}"
-TRACE_FILE="${TRACE_FILE:-${YQN_DIR}/traces/sharegpt_x/sharegpt_x_rate1p0.csv}"
+TRACE_DIR="${TRACE_DIR:-${YQN_DIR}/traces/sharegpt_x}"
+TRACE_GLOB="${TRACE_GLOB:-sharegpt_x_rate*.csv}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${YQN_DIR}/stats/online_round_robin}"
 
 RUNS="${RUNS:-5}"
@@ -33,9 +34,9 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
     exit 1
 fi
 
-if [[ ! -f "${TRACE_FILE}" ]]; then
-    echo "Trace file not found: ${TRACE_FILE}"
-    echo "Set TRACE_FILE=/abs/path/to/trace.csv"
+if [[ ! -d "${TRACE_DIR}" ]]; then
+    echo "Trace directory not found: ${TRACE_DIR}"
+    echo "Set TRACE_DIR=/abs/path/to/traces"
     exit 1
 fi
 
@@ -49,14 +50,6 @@ if ! "${PYTHON_BIN}" -c "import aiohttp, quart" >/dev/null 2>&1; then
     echo "Missing aiohttp/quart in .venv."
     echo "Install with: /root/.local/bin/uv pip install aiohttp quart"
     exit 1
-fi
-
-# install quart first -- required for disagg prefill proxy serve
-if python3 -c "import quart" &> /dev/null; then
-    echo "Quart is already installed."
-else
-    echo "Quart is not installed. Installing..."
-    python3 -m pip install quart
 fi
 
 PREFILL_PORTS=(8100 8101)
@@ -173,24 +166,59 @@ run_one_round() {
     local round_dir="${OUTPUT_ROOT}/run_${round_idx}"
     mkdir -p "${round_dir}"
 
-    start_pd_pair 0 "${PREFILL_GPUS[0]}" "${DECODE_GPUS[0]}"
-    start_pd_pair 1 "${PREFILL_GPUS[1]}" "${DECODE_GPUS[1]}"
+    local -a trace_files
+    mapfile -t trace_files < <(find "${TRACE_DIR}" -maxdepth 1 -type f -name "${TRACE_GLOB}" | sort)
 
-    # Give proxy servers a short stabilization window.
-    sleep 2
+    if [[ ${#trace_files[@]} -ne 5 ]]; then
+        echo "Expected exactly 5 trace files under ${TRACE_DIR} matching ${TRACE_GLOB}, got ${#trace_files[@]}"
+        return 1
+    fi
 
-    "${PYTHON_BIN}" "${YQN_DIR}/online_round_robin_dispatch.py" \
-        --trace-file "${TRACE_FILE}" \
-        --model "${MODEL_NAME}" \
-        --proxy-urls "http://${VLLM_HOST_IP}:${PROXY_PORTS[0]},http://${VLLM_HOST_IP}:${PROXY_PORTS[1]}" \
-        --timeout "${REQUEST_TIMEOUT_S}" \
-        --output-dir "${round_dir}"
+    local proxy_urls="http://${VLLM_HOST_IP}:${PROXY_PORTS[0]},http://${VLLM_HOST_IP}:${PROXY_PORTS[1]}"
+    local prefill_ranks="${PREFILL_GPUS[0]},${PREFILL_GPUS[1]}"
+
+    local trace_path
+    for trace_path in "${trace_files[@]}"; do
+        local trace_base
+        local trace_name
+        local trace_output_dir
+
+        trace_base="$(basename "${trace_path}")"
+        trace_name="${trace_base%.csv}"
+        trace_output_dir="${round_dir}/${trace_name}_async_first_prefill"
+
+        echo "[round ${round_idx}] start trace=${trace_name}"
+
+        start_pd_pair 0 "${PREFILL_GPUS[0]}" "${DECODE_GPUS[0]}"
+        start_pd_pair 1 "${PREFILL_GPUS[1]}" "${DECODE_GPUS[1]}"
+
+        # Give proxy servers a short stabilization window.
+        sleep 2
+
+        if ! "${PYTHON_BIN}" "${YQN_DIR}/online_trace_async_dispatch.py" \
+            --trace-file "${trace_path}" \
+            --model "${MODEL_NAME}" \
+            --proxy-urls "${proxy_urls}" \
+            --prefill-ranks "${prefill_ranks}" \
+            --timeout "${REQUEST_TIMEOUT_S}" \
+            --output-dir "${trace_output_dir}"; then
+            echo "Trace ${trace_name} failed."
+            stop_all_processes
+            return 1
+        fi
+
+        stop_all_processes
+        sleep 2
+
+        echo "[round ${round_idx}] done trace=${trace_name} output=${trace_output_dir}"
+    done
 }
 
 mkdir -p "${OUTPUT_ROOT}"
 
 echo "Model: ${MODEL_NAME}"
-echo "Trace: ${TRACE_FILE}"
+echo "Trace dir: ${TRACE_DIR}"
+echo "Trace glob: ${TRACE_GLOB}"
 echo "Output root: ${OUTPUT_ROOT}"
 echo "Host: ${VLLM_HOST_IP}"
 echo "Prefill GPUs: ${PREFILL_GPU_LIST}"
