@@ -32,13 +32,56 @@ def random_uuid() -> str:
     return uuid.uuid4().hex
 
 
+def _log(event: str, **fields: Any) -> None:
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    items = [
+        f"ts={timestamp}",
+        f"pid={os.getpid()}",
+        f"tid={threading.get_ident()}",
+        f"event={event}",
+    ]
+    for key, value in fields.items():
+        items.append(f"{key}={value!r}")
+    print(" ".join(items), flush=True)
+
+
+def _compact_id(value: str | None, limit: int = 80) -> str:
+    if not value:
+        return "none"
+    sanitized = value.replace(" ", "_")
+    if len(sanitized) <= limit:
+        return sanitized
+    return f"{sanitized[:limit]}..."
+
+
+def _request_shape(data: dict[str, Any]) -> dict[str, Any]:
+    prompt = data.get("prompt")
+    messages = data.get("messages")
+    return {
+        "keys": sorted(data.keys()),
+        "model": data.get("model"),
+        "stream": data.get("stream"),
+        "has_stream_options": "stream_options" in data,
+        "max_tokens": data.get("max_tokens"),
+        "max_completion_tokens": data.get("max_completion_tokens"),
+        "prompt_chars": len(prompt) if isinstance(prompt, str) else None,
+        "message_count": len(messages) if isinstance(messages, list) else None,
+    }
+
+
 def _remove_expired_instances(instances: dict[str, tuple[str, float]]) -> None:
     oldest_key = next(iter(instances), None)
     while oldest_key is not None:
         value = instances[oldest_key]
         if value[1] > time.time():
             break
-        print(f"Remove expired instance [HTTP:{oldest_key}, ZMQ:{value[0]}]")
+        _log(
+            "instance_expired",
+            http_address=oldest_key,
+            zmq_address=value[0],
+            expires_at=value[1],
+            now=time.time(),
+        )
         instances.pop(oldest_key, None)
         oldest_key = next(iter(instances), None)
 
@@ -63,9 +106,13 @@ def _listen_for_register(poller, router_socket):
                 )
                 _remove_expired_instances(prefill_instances)
             if node is None:
-                print(
-                    f"Add prefill instance [HTTP:{data['http_address']}, "
-                    f"ZMQ:{data['zmq_address']}]"
+                _log(
+                    "instance_registered",
+                    node_type="prefill",
+                    remote_address=remote_address.decode("utf-8", errors="replace"),
+                    http_address=data["http_address"],
+                    zmq_address=data["zmq_address"],
+                    ttl_seconds=DEFAULT_PING_SECONDS,
                 )
         elif data["type"] == "D":
             global decode_instances
@@ -78,12 +125,20 @@ def _listen_for_register(poller, router_socket):
                 )
                 _remove_expired_instances(decode_instances)
             if node is None:
-                print(
-                    f"Add decode instance [HTTP:{data['http_address']}, "
-                    f"ZMQ:{data['zmq_address']}]"
+                _log(
+                    "instance_registered",
+                    node_type="decode",
+                    remote_address=remote_address.decode("utf-8", errors="replace"),
+                    http_address=data["http_address"],
+                    zmq_address=data["zmq_address"],
+                    ttl_seconds=DEFAULT_PING_SECONDS,
                 )
         else:
-            print(f"Unexpected message from {remote_address}: {data}")
+            _log(
+                "instance_register_unexpected_message",
+                remote_address=remote_address.decode("utf-8", errors="replace"),
+                payload=data,
+            )
 
 
 def start_service_discovery(hostname: str, port: int):
@@ -107,30 +162,75 @@ def start_service_discovery(hostname: str, port: int):
 
 
 async def stream_upstream(
-    url: str, data: dict[str, Any], request_id: str
+    url: str,
+    data: dict[str, Any],
+    request_id: str,
+    stage: str,
 ) -> tuple[aiohttp.ClientResponse, aiohttp.ClientSession]:
     session = aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT)
     headers = {
         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
         "X-Request-Id": request_id,
     }
+    _log(
+        "upstream_request_start",
+        stage=stage,
+        url=url,
+        request_id=request_id,
+        payload=_request_shape(data),
+    )
     response = await session.post(url=url, json=data, headers=headers)
+    _log(
+        "upstream_response_headers",
+        stage=stage,
+        url=url,
+        request_id=request_id,
+        status=response.status,
+        content_type=response.headers.get("content-type"),
+        transfer_encoding=response.headers.get("transfer-encoding"),
+        content_length=response.headers.get("content-length"),
+    )
     return response, session
 
 
-async def fully_consume_upstream(url: str, data: dict[str, Any], request_id: str) -> None:
-    response, session = await stream_upstream(url, data, request_id)
+async def fully_consume_upstream(
+    url: str,
+    data: dict[str, Any],
+    request_id: str,
+    stage: str,
+) -> None:
+    _log(
+        "upstream_consume_begin",
+        stage=stage,
+        url=url,
+        request_id=request_id,
+    )
+    response, session = await stream_upstream(url, data, request_id, stage)
     try:
         payload = await response.read()
         if response.status >= 400:
             text = payload.decode("utf-8", errors="replace")
             raise HTTPException(
                 status_code=response.status,
-                detail=f"Prefill request failed: {text}",
+                detail=f"{stage} request failed: {text}",
             )
+        _log(
+            "upstream_consume_complete",
+            stage=stage,
+            url=url,
+            request_id=request_id,
+            status=response.status,
+            payload_bytes=len(payload),
+        )
     finally:
         response.release()
         await session.close()
+        _log(
+            "upstream_consume_session_closed",
+            stage=stage,
+            url=url,
+            request_id=request_id,
+        )
 
 
 def _select_pair() -> tuple[str, str, str, str]:
@@ -151,37 +251,86 @@ def _select_pair() -> tuple[str, str, str, str]:
 
     prefill_zmq_addr = prefill_info[0]
     decode_zmq_addr = decode_info[0]
-    print(
-        f"pair[{idx}] [HTTP:{prefill_addr}, ZMQ:{prefill_zmq_addr}] -> "
-        f"[HTTP:{decode_addr}, ZMQ:{decode_zmq_addr}]"
+    _log(
+        "pair_selected",
+        pair_index=idx,
+        prefill_http=prefill_addr,
+        prefill_zmq=prefill_zmq_addr,
+        decode_http=decode_addr,
+        decode_zmq=decode_zmq_addr,
+        prefill_pool_size=len(prefill_list),
+        decode_pool_size=len(decode_list),
     )
     return prefill_addr, prefill_zmq_addr, decode_addr, decode_zmq_addr
 
 
 async def _handle_openai_request(raw_request: Request, max_tokens_field: str):
     original_request_data = await raw_request.json()
+    client_host = raw_request.client.host if raw_request.client else "unknown"
+    client_port = raw_request.client.port if raw_request.client else "unknown"
+    incoming_request_id = raw_request.headers.get("x-request-id")
+    incoming_user_agent = raw_request.headers.get("user-agent")
     prefill_addr, prefill_zmq_addr, decode_addr, decode_zmq_addr = _select_pair()
 
     prefill_request = dict(original_request_data)
     prefill_request[max_tokens_field] = 1
+    prefill_request["stream"] = False
     if max_tokens_field == "max_completion_tokens":
         prefill_request["max_tokens"] = 1
+    prefill_request.pop("stream_options", None)
+    prefill_request.pop("stream_include_usage", None)
+    prefill_request.pop("stream_continuous_usage_stats", None)
 
+    incoming_request_id_suffix = _compact_id(incoming_request_id, limit=120)
     request_id = (
-        f"___prefill_addr_{prefill_zmq_addr}___decode_addr_"
-        f"{decode_zmq_addr}_{random_uuid()}"
+        f"client_req_{incoming_request_id_suffix}___prefill_addr_"
+        f"{prefill_zmq_addr}___decode_addr_{decode_zmq_addr}_{random_uuid()}"
+    )
+    _log(
+        "incoming_request",
+        path=raw_request.url.path,
+        method=raw_request.method,
+        client_host=client_host,
+        client_port=client_port,
+        user_agent=incoming_user_agent,
+        incoming_request_id=incoming_request_id,
+        proxy_request_id=request_id,
+        payload=_request_shape(original_request_data),
+    )
+    _log(
+        "request_routed",
+        proxy_request_id=request_id,
+        prefill_url=f"http://{prefill_addr}{raw_request.url.path}",
+        decode_url=f"http://{decode_addr}{raw_request.url.path}",
+        prefill_payload=_request_shape(prefill_request),
+        decode_payload=_request_shape(original_request_data),
     )
 
     await fully_consume_upstream(
         f"http://{prefill_addr}{raw_request.url.path}",
         prefill_request,
         request_id,
+        stage="prefill",
+    )
+
+    _log(
+        "prefill_stage_finished_switch_to_decode",
+        proxy_request_id=request_id,
+        decode_url=f"http://{decode_addr}{raw_request.url.path}",
     )
 
     decode_response, decode_session = await stream_upstream(
         f"http://{decode_addr}{raw_request.url.path}",
         original_request_data,
         request_id,
+        stage="decode",
+    )
+
+    _log(
+        "decode_stage_connected",
+        proxy_request_id=request_id,
+        status=decode_response.status,
+        content_type=decode_response.headers.get("content-type"),
     )
 
     if decode_response.status >= 400:
@@ -190,6 +339,11 @@ async def _handle_openai_request(raw_request: Request, max_tokens_field: str):
         finally:
             decode_response.release()
             await decode_session.close()
+            _log(
+                "decode_stage_error_session_closed",
+                proxy_request_id=request_id,
+                status=decode_response.status,
+            )
         raise HTTPException(
             status_code=decode_response.status,
             detail=f"Decode request failed: {payload}",
@@ -201,12 +355,28 @@ async def _handle_openai_request(raw_request: Request, max_tokens_field: str):
         headers["content-type"] = content_type
 
     async def body_iter():
+        chunk_count = 0
+        total_bytes = 0
         try:
             async for chunk in decode_response.content.iter_chunked(1024):
+                chunk_count += 1
+                total_bytes += len(chunk)
+                if chunk_count == 1:
+                    _log(
+                        "decode_stream_first_chunk",
+                        proxy_request_id=request_id,
+                        chunk_bytes=len(chunk),
+                    )
                 yield chunk
         finally:
             decode_response.release()
             await decode_session.close()
+            _log(
+                "decode_stream_complete",
+                proxy_request_id=request_id,
+                chunk_count=chunk_count,
+                total_bytes=total_bytes,
+            )
 
     return StreamingResponse(
         body_iter(),

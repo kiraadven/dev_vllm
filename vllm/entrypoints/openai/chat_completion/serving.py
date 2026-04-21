@@ -530,6 +530,8 @@ class OpenAIServingChat(OpenAIServing):
         created_time = int(time.time())
         chunk_object_type: Final = "chat.completion.chunk"
         first_iteration = True
+        first_result_logged = False
+        first_stream_chunk_logged = False
 
         # Send response for each token for each request.n (index)
         num_choices = 1 if request.n is None else request.n
@@ -626,6 +628,23 @@ class OpenAIServingChat(OpenAIServing):
 
         try:
             async for res in result_generator:
+                if not first_result_logged:
+                    logger.info(
+                        "CHAT_STREAM_RESULT_BEGIN request_id=%s model=%s "
+                        "output_count=%d prompt_tokens=%s finished=%s "
+                        "num_cached_tokens=%s",
+                        request_id,
+                        model_name,
+                        len(res.outputs),
+                        (
+                            len(res.prompt_token_ids)
+                            if res.prompt_token_ids is not None
+                            else None
+                        ),
+                        res.finished,
+                        res.num_cached_tokens,
+                    )
+                    first_result_logged = True
                 if res.prompt_token_ids is not None:
                     num_prompt_tokens = len(res.prompt_token_ids)
                     if res.encoder_prompt_token_ids is not None:
@@ -676,6 +695,15 @@ class OpenAIServingChat(OpenAIServing):
                             )
 
                         data = chunk.model_dump_json(exclude_unset=True)
+                        if not first_stream_chunk_logged:
+                            logger.info(
+                                "CHAT_STREAM_FIRST_CHUNK request_id=%s model=%s "
+                                "stage=role_chunk choice_index=%d",
+                                request_id,
+                                model_name,
+                                i,
+                            )
+                            first_stream_chunk_logged = True
                         yield f"data: {data}\n\n"
 
                     # Send response to echo the input portion of the
@@ -712,6 +740,15 @@ class OpenAIServingChat(OpenAIServing):
                                     )
 
                                 data = chunk.model_dump_json(exclude_unset=True)
+                                if not first_stream_chunk_logged:
+                                    logger.info(
+                                        "CHAT_STREAM_FIRST_CHUNK request_id=%s "
+                                        "model=%s stage=echo_chunk choice_index=%d",
+                                        request_id,
+                                        model_name,
+                                        i,
+                                    )
+                                    first_stream_chunk_logged = True
                                 yield f"data: {data}\n\n"
                     first_iteration = False
 

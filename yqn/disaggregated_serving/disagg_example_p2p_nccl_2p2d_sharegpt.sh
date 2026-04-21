@@ -53,6 +53,13 @@ parse_csv_array() {
     IFS=',' read -r -a target_array <<< "$raw"
 }
 
+launch_in_new_session() {
+    local log_file="$1"
+    shift
+    setsid "$@" >"${log_file}" 2>&1 &
+    PIDS+=("$!")
+}
+
 check_required_files() {
     local missing=0
     for path in "${PYTHON_BIN}" "${VLLM_BIN}" "${PROXY_SCRIPT}"; do
@@ -158,16 +165,31 @@ wait_for_http() {
 
 cleanup() {
     local pid=""
+    local deadline=""
     trap - EXIT INT TERM
     echo "Cleaning up processes..."
     for pid in "${PIDS[@]:-}"; do
-        pkill -TERM -P "${pid}" >/dev/null 2>&1 || true
+        kill -TERM -- "-${pid}" >/dev/null 2>&1 || true
         kill -TERM "${pid}" >/dev/null 2>&1 || true
     done
-    sleep 2
+    deadline=$((SECONDS + 10))
+    while (( SECONDS < deadline )); do
+        local any_alive=0
+        for pid in "${PIDS[@]:-}"; do
+            if kill -0 "${pid}" >/dev/null 2>&1; then
+                any_alive=1
+                break
+            fi
+        done
+        if (( any_alive == 0 )); then
+            break
+        fi
+        sleep 1
+    done
     for pid in "${PIDS[@]:-}"; do
-        pkill -KILL -P "${pid}" >/dev/null 2>&1 || true
+        kill -KILL -- "-${pid}" >/dev/null 2>&1 || true
         kill -KILL "${pid}" >/dev/null 2>&1 || true
+        wait "${pid}" >/dev/null 2>&1 || true
     done
 }
 
@@ -191,12 +213,11 @@ EOF
 
 launch_proxy() {
     echo "Starting proxy: ${PROXY_SCRIPT}"
-    "${PYTHON_BIN}" "${PROXY_SCRIPT}" \
+    launch_in_new_session "${LOG_DIR}/proxy.log" \
+        "${PYTHON_BIN}" "${PROXY_SCRIPT}" \
         --host 0.0.0.0 \
         --port "${PROXY_HTTP_PORT}" \
-        --discovery-port "${PROXY_DISCOVERY_PORT}" \
-        >"${LOG_DIR}/proxy.log" 2>&1 &
-    PIDS+=("$!")
+        --discovery-port "${PROXY_DISCOVERY_PORT}"
     wait_for_http "http://127.0.0.1:${PROXY_HTTP_PORT}/health" "proxy"
 }
 
@@ -210,9 +231,11 @@ launch_prefill_servers() {
         kv_config="{\"kv_connector\":\"P2pNcclConnector\",\"kv_role\":\"kv_producer\",\"kv_buffer_size\":\"1e1\",\"kv_port\":\"${kv_port}\",\"kv_connector_extra_config\":{\"proxy_ip\":\"0.0.0.0\",\"proxy_port\":\"${PROXY_DISCOVERY_PORT}\",\"http_port\":\"${api_port}\",\"send_type\":\"PUT_ASYNC\",\"nccl_num_channels\":\"16\"}}"
 
         echo "Starting prefill $((i + 1)): GPU=${gpu_id}, api_port=${api_port}, kv_port=${kv_port}"
-        VLLM_ENGINE_READY_TIMEOUT_S="${TIMEOUT_SECONDS}" \
-        CUDA_VISIBLE_DEVICES="${gpu_id}" \
-        "${VLLM_BIN}" serve "${MODEL}" \
+        launch_in_new_session "${LOG_DIR}/prefill$((i + 1)).log" \
+            env \
+            VLLM_ENGINE_READY_TIMEOUT_S="${TIMEOUT_SECONDS}" \
+            CUDA_VISIBLE_DEVICES="${gpu_id}" \
+            "${VLLM_BIN}" serve "${MODEL}" \
             --enforce-eager \
             --host 0.0.0.0 \
             --port "${api_port}" \
@@ -224,9 +247,7 @@ launch_prefill_servers() {
             --max-num-seqs 256 \
             --trust-remote-code \
             --gpu-memory-utilization 0.9 \
-            --kv-transfer-config "${kv_config}" \
-            >"${LOG_DIR}/prefill$((i + 1)).log" 2>&1 &
-        PIDS+=("$!")
+            --kv-transfer-config "${kv_config}"
     done
 
     for api_port in "${PREFILL_PORT_ARRAY[@]}"; do
@@ -244,9 +265,11 @@ launch_decode_servers() {
         kv_config="{\"kv_connector\":\"P2pNcclConnector\",\"kv_role\":\"kv_consumer\",\"kv_buffer_size\":\"8e9\",\"kv_port\":\"${kv_port}\",\"kv_connector_extra_config\":{\"proxy_ip\":\"0.0.0.0\",\"proxy_port\":\"${PROXY_DISCOVERY_PORT}\",\"http_port\":\"${api_port}\",\"send_type\":\"PUT_ASYNC\",\"nccl_num_channels\":\"16\"}}"
 
         echo "Starting decode $((i + 1)): GPU=${gpu_id}, api_port=${api_port}, kv_port=${kv_port}"
-        VLLM_ENGINE_READY_TIMEOUT_S="${TIMEOUT_SECONDS}" \
-        CUDA_VISIBLE_DEVICES="${gpu_id}" \
-        "${VLLM_BIN}" serve "${MODEL}" \
+        launch_in_new_session "${LOG_DIR}/decode$((i + 1)).log" \
+            env \
+            VLLM_ENGINE_READY_TIMEOUT_S="${TIMEOUT_SECONDS}" \
+            CUDA_VISIBLE_DEVICES="${gpu_id}" \
+            "${VLLM_BIN}" serve "${MODEL}" \
             --enforce-eager \
             --host 0.0.0.0 \
             --port "${api_port}" \
@@ -258,9 +281,7 @@ launch_decode_servers() {
             --max-num-seqs 256 \
             --trust-remote-code \
             --gpu-memory-utilization 0.7 \
-            --kv-transfer-config "${kv_config}" \
-            >"${LOG_DIR}/decode$((i + 1)).log" 2>&1 &
-        PIDS+=("$!")
+            --kv-transfer-config "${kv_config}"
     done
 
     for api_port in "${DECODE_PORT_ARRAY[@]}"; do
@@ -283,7 +304,7 @@ run_sharegpt_benchmark() {
         --burstiness "${BENCH_BURSTINESS}" \
         --max-concurrency "${BENCH_MAX_CONCURRENCY}" \
         --seed "${BENCH_SEED}" \
-        | tee "${LOG_DIR}/benchmark.log"
+        2>&1 | tee "${LOG_DIR}/benchmark.log"
 }
 
 main() {

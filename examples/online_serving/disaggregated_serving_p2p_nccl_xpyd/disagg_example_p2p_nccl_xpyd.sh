@@ -21,15 +21,15 @@
 # =============================================================================
 
 # Configuration - can be overridden via environment variables
-MODEL=${MODEL:-meta-llama/Llama-3.1-8B-Instruct}
+MODEL=${MODEL:-/data/yqn/Qwen1.5-MoE-A2.7B}
 TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-1200}
 PROXY_PORT=${PROXY_PORT:-30001}
 
 # Default 1P3D configuration (1 Prefill + 3 Decode)
 PREFILL_GPUS=${PREFILL_GPUS:-0}
-DECODE_GPUS=${DECODE_GPUS:-1,2,3}
+DECODE_GPUS=${DECODE_GPUS:-1}
 PREFILL_PORTS=${PREFILL_PORTS:-20003}
-DECODE_PORTS=${DECODE_PORTS:-20005,20007,20009}
+DECODE_PORTS=${DECODE_PORTS:-20005}
 
 echo "Warning: P2P NCCL disaggregated prefill XpYd support for vLLM v1 is experimental and subject to change."
 echo ""
@@ -124,7 +124,7 @@ wait_for_server() {
 
 main() {
     check_required_files
-    check_hf_token
+    # check_hf_token
     check_num_gpus
     ensure_python_library_installed pandas
     ensure_python_library_installed datasets
@@ -173,7 +173,7 @@ main() {
         --tensor-parallel-size 1 \
         --seed 1024 \
         --dtype float16 \
-        --max-model-len 10000 \
+        --max-model-len 8192 \
         --max-num-batched-tokens 10000 \
         --max-num-seqs 256 \
         --trust-remote-code \
@@ -201,7 +201,7 @@ main() {
         --tensor-parallel-size 1 \
         --seed 1024 \
         --dtype float16 \
-        --max-model-len 10000 \
+        --max-model-len 8192 \
         --max-num-batched-tokens 10000 \
         --max-num-seqs 256 \
         --trust-remote-code \

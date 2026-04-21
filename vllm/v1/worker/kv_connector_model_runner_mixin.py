@@ -94,20 +94,38 @@ class KVConnectorModelRunnerMixin:
         assert isinstance(kv_connector, KVConnectorBase)
         assert scheduler_output.kv_connector_metadata is not None
         kv_connector.bind_connector_metadata(scheduler_output.kv_connector_metadata)
+        logger.info(
+            "KV_CONNECTOR_LIFECYCLE_BOUND wait_for_save=%s defer_finalize=%s "
+            "finished_req_count=%d metadata_type=%s",
+            wait_for_save,
+            defer_finalize,
+            len(scheduler_output.finished_req_ids),
+            type(scheduler_output.kv_connector_metadata).__name__,
+        )
 
         # Background KV cache transfers happen here.
         # These transfers are designed to be async and the requests
         # involved may be disjoint from the running requests.
         # Do this here to save a collective_rpc.
+        logger.info("KV_CONNECTOR_LIFECYCLE_START_LOAD_BEGIN")
         kv_connector.start_load_kv(get_forward_context())
+        logger.info("KV_CONNECTOR_LIFECYCLE_START_LOAD_END")
         try:
             yield output
         finally:
             if wait_for_save and not defer_finalize:
+                logger.info("KV_CONNECTOR_LIFECYCLE_WAIT_FOR_SAVE_BEGIN")
                 kv_connector.wait_for_save()
+                logger.info("KV_CONNECTOR_LIFECYCLE_WAIT_FOR_SAVE_END")
 
             output.finished_sending, output.finished_recving = (
                 kv_connector.get_finished(scheduler_output.finished_req_ids)
+            )
+            logger.info(
+                "KV_CONNECTOR_LIFECYCLE_GET_FINISHED finished_sending=%s "
+                "finished_recving=%s",
+                output.finished_sending,
+                output.finished_recving,
             )
             output.invalid_block_ids = kv_connector.get_block_ids_with_load_errors()
 
