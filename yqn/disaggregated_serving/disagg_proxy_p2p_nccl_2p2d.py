@@ -7,6 +7,7 @@ import socket
 import threading
 import time
 import uuid
+from ipaddress import ip_address
 from typing import Any
 
 import aiohttp
@@ -67,6 +68,37 @@ def _request_shape(data: dict[str, Any]) -> dict[str, Any]:
         "prompt_chars": len(prompt) if isinstance(prompt, str) else None,
         "message_count": len(messages) if isinstance(messages, list) else None,
     }
+
+
+def _split_host_port(address: str) -> tuple[str, int]:
+    host, sep, port_text = address.rpartition(":")
+    if not sep:
+        return address, -1
+    try:
+        return host, int(port_text)
+    except ValueError:
+        return host, -1
+
+
+def _normalize_host(host: str) -> tuple[int, Any]:
+    try:
+        return (0, ip_address(host))
+    except ValueError:
+        return (1, host)
+
+
+def _instance_sort_key(item: tuple[str, tuple[str, float]]) -> tuple[Any, ...]:
+    http_addr, (zmq_addr, _) = item
+    zmq_host, zmq_port = _split_host_port(zmq_addr)
+    http_host, http_port = _split_host_port(http_addr)
+    return (
+        _normalize_host(zmq_host),
+        zmq_port,
+        _normalize_host(http_host),
+        http_port,
+        zmq_addr,
+        http_addr,
+    )
 
 
 def _remove_expired_instances(instances: dict[str, tuple[str, float]]) -> None:
@@ -237,9 +269,10 @@ def _select_pair() -> tuple[str, str, str, str]:
     global count
 
     with prefill_cv:
-        prefill_list = list(prefill_instances.items())
+        prefill_list = sorted(prefill_instances.items(),
+                              key=_instance_sort_key)
     with decode_cv:
-        decode_list = list(decode_instances.items())
+        decode_list = sorted(decode_instances.items(), key=_instance_sort_key)
 
     if not prefill_list or not decode_list:
         raise HTTPException(status_code=503, detail="No prefill/decode instances ready")
