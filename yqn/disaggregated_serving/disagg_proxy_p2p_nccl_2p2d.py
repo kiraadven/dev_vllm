@@ -70,6 +70,16 @@ def _request_shape(data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _attach_shared_request_id(
+    data: dict[str, Any], request_id: str
+) -> dict[str, Any]:
+    updated = dict(data)
+    kv_transfer_params = dict(updated.get("kv_transfer_params") or {})
+    kv_transfer_params["shared_request_id"] = request_id
+    updated["kv_transfer_params"] = kv_transfer_params
+    return updated
+
+
 def _split_host_port(address: str) -> tuple[str, int]:
     host, sep, port_text = address.rpartition(":")
     if not sep:
@@ -298,13 +308,20 @@ def _select_pair() -> tuple[str, str, str, str]:
 
 
 async def _handle_openai_request(raw_request: Request, max_tokens_field: str):
-    original_request_data = await raw_request.json()
+    raw_request_data = await raw_request.json()
     client_host = raw_request.client.host if raw_request.client else "unknown"
     client_port = raw_request.client.port if raw_request.client else "unknown"
     incoming_request_id = raw_request.headers.get("x-request-id")
     incoming_user_agent = raw_request.headers.get("user-agent")
     prefill_addr, prefill_zmq_addr, decode_addr, decode_zmq_addr = _select_pair()
 
+    incoming_request_id_suffix = _compact_id(incoming_request_id, limit=120)
+    request_id = (
+        f"client_req_{incoming_request_id_suffix}___prefill_addr_"
+        f"{prefill_zmq_addr}___decode_addr_{decode_zmq_addr}_{random_uuid()}"
+    )
+
+    original_request_data = _attach_shared_request_id(raw_request_data, request_id)
     prefill_request = dict(original_request_data)
     prefill_request[max_tokens_field] = 1
     prefill_request["stream"] = False
@@ -313,12 +330,6 @@ async def _handle_openai_request(raw_request: Request, max_tokens_field: str):
     prefill_request.pop("stream_options", None)
     prefill_request.pop("stream_include_usage", None)
     prefill_request.pop("stream_continuous_usage_stats", None)
-
-    incoming_request_id_suffix = _compact_id(incoming_request_id, limit=120)
-    request_id = (
-        f"client_req_{incoming_request_id_suffix}___prefill_addr_"
-        f"{prefill_zmq_addr}___decode_addr_{decode_zmq_addr}_{random_uuid()}"
-    )
     _log(
         "incoming_request",
         path=raw_request.url.path,

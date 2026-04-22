@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -29,6 +30,14 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+def _tensor_summary(tensor: torch.Tensor) -> str:
+    bytes_size = tensor.element_size() * tensor.numel()
+    return (
+        f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+        f"device={tensor.device} bytes={bytes_size}"
+    )
 
 
 @dataclass
@@ -129,6 +138,10 @@ class P2pNcclConnector(KVConnectorBase_V1):
 
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
+            logger.info(
+                "P2P_CONNECTOR_LOAD_SKIP rank=%d reason=no_attn_metadata",
+                self._rank,
+            )
             return
 
         def inject_kv_into_layer(
@@ -200,11 +213,13 @@ class P2pNcclConnector(KVConnectorBase_V1):
             return
 
         logger.info(
-            "P2P_CONNECTOR_LOAD_BEGIN role=consumer rank=%d request_count=%d "
-            "layer_count=%d",
+            "P2P_CONNECTOR_LOAD_BEGIN rank=%d request_count=%d layer_count=%d "
+            "attn_metadata_type=%s kwargs_keys=%s",
             self._rank,
             len(metadata.requests),
             len(forward_context.no_compile_layers),
+            type(attn_metadata).__name__,
+            sorted(kwargs.keys()),
         )
 
         # Load the KV for each request each layer
@@ -229,48 +244,65 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 # layers like FusedMoE
                 kv_cache = getattr(layer, "kv_cache", None)
                 if kv_cache is None:
+                    logger.info(
+                        "P2P_CONNECTOR_LAYER_SKIP request_id=%s layer_name=%s "
+                        "rank=%d reason=no_kv_cache_attr layer_type=%s",
+                        request_id,
+                        layer_name,
+                        self._rank,
+                        type(layer).__name__,
+                    )
                     continue
 
                 layer = kv_cache
-
+                recv_start = time.perf_counter()
                 logger.info(
                     "P2P_CONNECTOR_LAYER_RECV_BEGIN request_id=%s layer_name=%s "
-                    "remote_address=%s rank=%d",
+                    "remote_address=%s rank=%d target=%s",
                     request.request_id,
                     layer_name,
                     remote_address,
                     self._rank,
+                    _tensor_summary(layer),
                 )
+
                 kv_cache = self.p2p_nccl_engine.recv_tensor(
                     request.request_id + "#" + layer_name, remote_address
                 )
 
                 if kv_cache is None:
-                    logger.warning("🚧kv_cache is None, %s", request.request_id)
+                    logger.warning(
+                        "P2P_CONNECTOR_LAYER_RECV_EMPTY request_id=%s "
+                        "layer_name=%s remote_address=%s rank=%d duration_ms=%.3f",
+                        request.request_id,
+                        layer_name,
+                        remote_address,
+                        self._rank,
+                        (time.perf_counter() - recv_start) * 1000,
+                    )
                     continue
 
                 logger.info(
                     "P2P_CONNECTOR_LAYER_RECV_DONE request_id=%s layer_name=%s "
-                    "remote_address=%s rank=%d kv_shape=%s kv_dtype=%s "
-                    "target_shape=%s",
+                    "remote_address=%s rank=%d duration_ms=%.3f kv=%s",
                     request.request_id,
                     layer_name,
                     remote_address,
                     self._rank,
-                    tuple(kv_cache.shape),
-                    str(kv_cache.dtype),
-                    tuple(layer.shape),
+                    (time.perf_counter() - recv_start) * 1000,
+                    _tensor_summary(kv_cache),
                 )
                 inject_kv_into_layer(
                     layer, kv_cache, request.block_ids, request.request_id
                 )
                 logger.info(
                     "P2P_CONNECTOR_LAYER_INJECT_DONE request_id=%s layer_name=%s "
-                    "remote_address=%s rank=%d",
+                    "remote_address=%s rank=%d target=%s",
                     request.request_id,
                     layer_name,
                     remote_address,
                     self._rank,
+                    _tensor_summary(layer),
                 )
 
             logger.info(
@@ -282,7 +314,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
             )
 
         logger.info(
-            "P2P_CONNECTOR_LOAD_END role=consumer rank=%d request_count=%d",
+            "P2P_CONNECTOR_LOAD_END rank=%d request_count=%d",
             self._rank,
             len(metadata.requests),
         )
@@ -321,11 +353,6 @@ class P2pNcclConnector(KVConnectorBase_V1):
             return
 
         assert self.p2p_nccl_engine is not None
-        logger.info(
-            "P2P_CONNECTOR_SAVE_LAYER_BEGIN role=producer rank=%d layer_name=%s",
-            self._rank,
-            layer_name,
-        )
 
         def extract_kv_from_layer(
             layer: torch.Tensor,
@@ -360,48 +387,67 @@ class P2pNcclConnector(KVConnectorBase_V1):
 
         connector_metadata = self._get_connector_metadata()
         assert isinstance(connector_metadata, P2pNcclConnectorMetadata)
+        logger.info(
+            "P2P_CONNECTOR_SAVE_BEGIN rank=%d layer_name=%s request_count=%d "
+            "attn_metadata_type=%s",
+            self._rank,
+            layer_name,
+            len(connector_metadata.requests),
+            type(attn_metadata).__name__,
+        )
         for request in connector_metadata.requests:
             request_id = request.request_id
             ip, port = self.parse_request_id(request_id, True)
             remote_address = ip + ":" + str(port + self._rank)
 
             kv_cache = extract_kv_from_layer(kv_layer, request.block_ids)
+            if kv_cache is None:
+                logger.warning(
+                    "P2P_CONNECTOR_SAVE_SKIP request_id=%s layer_name=%s "
+                    "remote_address=%s rank=%d reason=unsupported_layout "
+                    "kv_layer_shape=%s",
+                    request_id,
+                    layer_name,
+                    remote_address,
+                    self._rank,
+                    tuple(kv_layer.shape),
+                )
+                continue
             logger.info(
-                "P2P_CONNECTOR_LAYER_SEND_BEGIN request_id=%s layer_name=%s "
-                "remote_address=%s rank=%d block_count=%d kv_shape=%s kv_dtype=%s",
+                "P2P_CONNECTOR_SAVE_REQUEST request_id=%s layer_name=%s "
+                "remote_address=%s rank=%d block_count=%d kv=%s",
                 request_id,
                 layer_name,
                 remote_address,
                 self._rank,
                 len(request.block_ids),
-                tuple(kv_cache.shape) if kv_cache is not None else None,
-                str(kv_cache.dtype) if kv_cache is not None else None,
+                _tensor_summary(kv_cache),
             )
-            send_ok = self.p2p_nccl_engine.send_tensor(
+            self.p2p_nccl_engine.send_tensor(
                 request_id + "#" + layer_name, kv_cache, remote_address
             )
             logger.info(
-                "P2P_CONNECTOR_LAYER_SEND_DONE request_id=%s layer_name=%s "
-                "remote_address=%s rank=%d send_ok=%s",
+                "P2P_CONNECTOR_SAVE_REQUEST_DONE request_id=%s layer_name=%s "
+                "remote_address=%s rank=%d",
                 request_id,
                 layer_name,
                 remote_address,
                 self._rank,
-                send_ok,
             )
+
+        logger.info(
+            "P2P_CONNECTOR_SAVE_END rank=%d layer_name=%s request_count=%d",
+            self._rank,
+            layer_name,
+            len(connector_metadata.requests),
+        )
 
     def wait_for_save(self):
         if self.is_producer:
             assert self.p2p_nccl_engine is not None
-            logger.info(
-                "P2P_CONNECTOR_WAIT_FOR_SAVE_BEGIN role=producer rank=%d",
-                self._rank,
-            )
+            logger.info("P2P_CONNECTOR_WAIT_FOR_SAVE_BEGIN rank=%d", self._rank)
             self.p2p_nccl_engine.wait_for_sent()
-            logger.info(
-                "P2P_CONNECTOR_WAIT_FOR_SAVE_END role=producer rank=%d",
-                self._rank,
-            )
+            logger.info("P2P_CONNECTOR_WAIT_FOR_SAVE_END rank=%d", self._rank)
 
     def get_finished(
         self, finished_req_ids: set[str], **kwargs: Any
@@ -420,6 +466,12 @@ class P2pNcclConnector(KVConnectorBase_V1):
         assert self.p2p_nccl_engine is not None
 
         no_compile_layers = self._vllm_config.compilation_config.static_forward_context
+        logger.info(
+            "P2P_CONNECTOR_GET_FINISHED rank=%d finished_req_count=%d ids=%s",
+            self._rank,
+            len(finished_req_ids),
+            sorted(finished_req_ids),
+        )
         return self.p2p_nccl_engine.get_finished(finished_req_ids, no_compile_layers)
 
     # ==============================
@@ -584,14 +636,6 @@ class P2pNcclConnector(KVConnectorBase_V1):
         """
 
         self.chunked_prefill.pop(request.request_id, None)
-        logger.info(
-            "P2P_CONNECTOR_REQUEST_FINISHED request_id=%s role=%s rank=%d "
-            "return_async=%s",
-            request.request_id,
-            "producer" if self.is_producer else "consumer",
-            self._rank,
-            False,
-        )
 
         return False, None
 
