@@ -44,6 +44,8 @@ def _tensor_summary(tensor: torch.Tensor) -> str:
 class ReqMeta:
     # Request Id
     request_id: str
+    # Original external request id generated before EngineCore rewrites.
+    external_req_id: str | None
     # Request block ids
     block_ids: torch.Tensor
     # Request num tokens
@@ -51,11 +53,16 @@ class ReqMeta:
 
     @staticmethod
     def make_meta(
-        request_id: str, token_ids: list[int], block_ids: list[int], block_size: int
+        request_id: str,
+        external_req_id: str | None,
+        token_ids: list[int],
+        block_ids: list[int],
+        block_size: int,
     ) -> "ReqMeta":
         block_ids_tensor = torch.tensor(block_ids)
         return ReqMeta(
             request_id=request_id,
+            external_req_id=external_req_id,
             block_ids=block_ids_tensor,
             num_tokens=len(token_ids),
         )
@@ -71,12 +78,19 @@ class P2pNcclConnectorMetadata(KVConnectorMetadata):
     def add_request(
         self,
         request_id: str,
+        external_req_id: str | None,
         token_ids: list[int],
         block_ids: list[int],
         block_size: int,
     ) -> None:
         self.requests.append(
-            ReqMeta.make_meta(request_id, token_ids, block_ids, block_size)
+            ReqMeta.make_meta(
+                request_id,
+                external_req_id,
+                token_ids,
+                block_ids,
+                block_size,
+            )
         )
 
 
@@ -95,7 +109,11 @@ class P2pNcclConnector(KVConnectorBase_V1):
         self._block_size = vllm_config.cache_config.block_size
         self._requests_need_load: dict[str, Any] = {}
         self.is_producer = self._kv_transfer_config.is_kv_producer
-        self.chunked_prefill: dict[str, tuple[list[int], list[int] | None]] = {}
+        self.chunked_prefill: dict[
+            str,
+            tuple[list[int], list[int] | None, str | None],
+        ] = {}
+        self._external_req_ids: dict[str, str] = {}
 
         self._rank = get_world_group().rank if role == KVConnectorRole.WORKER else 0
         self._local_rank = (
@@ -225,12 +243,16 @@ class P2pNcclConnector(KVConnectorBase_V1):
         # Load the KV for each request each layer
         for request in metadata.requests:
             request_id = request.request_id
-            ip, port = self.parse_request_id(request_id, False)
+            external_req_id = request.external_req_id or request_id
+            self._external_req_ids[request_id] = external_req_id
+            ip, port = self.parse_request_id(external_req_id, False)
             remote_address = ip + ":" + str(port + self._rank)
             logger.info(
-                "P2P_CONNECTOR_LOAD_REQUEST_BEGIN request_id=%s remote_address=%s "
-                "rank=%d block_count=%d num_tokens=%d",
+                "P2P_CONNECTOR_LOAD_REQUEST_BEGIN request_id=%s "
+                "external_req_id=%s remote_address=%s rank=%d "
+                "block_count=%d num_tokens=%d",
                 request_id,
+                external_req_id,
                 remote_address,
                 self._rank,
                 len(request.block_ids),
@@ -257,9 +279,11 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 layer = kv_cache
                 recv_start = time.perf_counter()
                 logger.info(
-                    "P2P_CONNECTOR_LAYER_RECV_BEGIN request_id=%s layer_name=%s "
-                    "remote_address=%s rank=%d target=%s",
+                    "P2P_CONNECTOR_LAYER_RECV_BEGIN request_id=%s "
+                    "external_req_id=%s layer_name=%s remote_address=%s "
+                    "rank=%d target=%s",
                     request.request_id,
+                    external_req_id,
                     layer_name,
                     remote_address,
                     self._rank,
@@ -267,14 +291,16 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 )
 
                 kv_cache = self.p2p_nccl_engine.recv_tensor(
-                    request.request_id + "#" + layer_name, remote_address
+                    external_req_id + "#" + layer_name, remote_address
                 )
 
                 if kv_cache is None:
                     logger.warning(
                         "P2P_CONNECTOR_LAYER_RECV_EMPTY request_id=%s "
-                        "layer_name=%s remote_address=%s rank=%d duration_ms=%.3f",
+                        "external_req_id=%s layer_name=%s remote_address=%s "
+                        "rank=%d duration_ms=%.3f",
                         request.request_id,
+                        external_req_id,
                         layer_name,
                         remote_address,
                         self._rank,
@@ -283,9 +309,11 @@ class P2pNcclConnector(KVConnectorBase_V1):
                     continue
 
                 logger.info(
-                    "P2P_CONNECTOR_LAYER_RECV_DONE request_id=%s layer_name=%s "
-                    "remote_address=%s rank=%d duration_ms=%.3f kv=%s",
+                    "P2P_CONNECTOR_LAYER_RECV_DONE request_id=%s "
+                    "external_req_id=%s layer_name=%s remote_address=%s "
+                    "rank=%d duration_ms=%.3f kv=%s",
                     request.request_id,
+                    external_req_id,
                     layer_name,
                     remote_address,
                     self._rank,
@@ -296,9 +324,11 @@ class P2pNcclConnector(KVConnectorBase_V1):
                     layer, kv_cache, request.block_ids, request.request_id
                 )
                 logger.info(
-                    "P2P_CONNECTOR_LAYER_INJECT_DONE request_id=%s layer_name=%s "
-                    "remote_address=%s rank=%d target=%s",
+                    "P2P_CONNECTOR_LAYER_INJECT_DONE request_id=%s "
+                    "external_req_id=%s layer_name=%s remote_address=%s "
+                    "rank=%d target=%s",
                     request.request_id,
+                    external_req_id,
                     layer_name,
                     remote_address,
                     self._rank,
@@ -306,9 +336,10 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 )
 
             logger.info(
-                "P2P_CONNECTOR_LOAD_REQUEST_DONE request_id=%s remote_address=%s "
-                "rank=%d",
+                "P2P_CONNECTOR_LOAD_REQUEST_DONE request_id=%s "
+                "external_req_id=%s remote_address=%s rank=%d",
                 request_id,
+                external_req_id,
                 remote_address,
                 self._rank,
             )
@@ -397,16 +428,19 @@ class P2pNcclConnector(KVConnectorBase_V1):
         )
         for request in connector_metadata.requests:
             request_id = request.request_id
-            ip, port = self.parse_request_id(request_id, True)
+            external_req_id = request.external_req_id or request_id
+            self._external_req_ids[request_id] = external_req_id
+            ip, port = self.parse_request_id(external_req_id, True)
             remote_address = ip + ":" + str(port + self._rank)
 
             kv_cache = extract_kv_from_layer(kv_layer, request.block_ids)
             if kv_cache is None:
                 logger.warning(
-                    "P2P_CONNECTOR_SAVE_SKIP request_id=%s layer_name=%s "
-                    "remote_address=%s rank=%d reason=unsupported_layout "
-                    "kv_layer_shape=%s",
+                    "P2P_CONNECTOR_SAVE_SKIP request_id=%s external_req_id=%s "
+                    "layer_name=%s remote_address=%s rank=%d "
+                    "reason=unsupported_layout kv_layer_shape=%s",
                     request_id,
+                    external_req_id,
                     layer_name,
                     remote_address,
                     self._rank,
@@ -414,9 +448,10 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 )
                 continue
             logger.info(
-                "P2P_CONNECTOR_SAVE_REQUEST request_id=%s layer_name=%s "
-                "remote_address=%s rank=%d block_count=%d kv=%s",
+                "P2P_CONNECTOR_SAVE_REQUEST request_id=%s external_req_id=%s "
+                "layer_name=%s remote_address=%s rank=%d block_count=%d kv=%s",
                 request_id,
+                external_req_id,
                 layer_name,
                 remote_address,
                 self._rank,
@@ -424,12 +459,13 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 _tensor_summary(kv_cache),
             )
             self.p2p_nccl_engine.send_tensor(
-                request_id + "#" + layer_name, kv_cache, remote_address
+                external_req_id + "#" + layer_name, kv_cache, remote_address
             )
             logger.info(
-                "P2P_CONNECTOR_SAVE_REQUEST_DONE request_id=%s layer_name=%s "
-                "remote_address=%s rank=%d",
+                "P2P_CONNECTOR_SAVE_REQUEST_DONE request_id=%s "
+                "external_req_id=%s layer_name=%s remote_address=%s rank=%d",
                 request_id,
+                external_req_id,
                 layer_name,
                 remote_address,
                 self._rank,
@@ -472,7 +508,17 @@ class P2pNcclConnector(KVConnectorBase_V1):
             len(finished_req_ids),
             sorted(finished_req_ids),
         )
-        return self.p2p_nccl_engine.get_finished(finished_req_ids, no_compile_layers)
+        translated_finished_req_ids = {
+            self._external_req_ids.get(request_id, request_id)
+            for request_id in finished_req_ids
+        }
+        result = self.p2p_nccl_engine.get_finished(
+            translated_finished_req_ids,
+            no_compile_layers,
+        )
+        for request_id in finished_req_ids:
+            self._external_req_ids.pop(request_id, None)
+        return result
 
     # ==============================
     # Scheduler-side methods
@@ -546,11 +592,13 @@ class P2pNcclConnector(KVConnectorBase_V1):
                     self.chunked_prefill[new_req.req_id] = (
                         new_req.block_ids[0],
                         new_req.prompt_token_ids,
+                        new_req.external_req_id,
                     )
                     continue
                 # the request's prompt is not chunked prefill
                 meta.add_request(
                     request_id=new_req.req_id,
+                    external_req_id=new_req.external_req_id,
                     token_ids=new_req.prompt_token_ids or [],
                     block_ids=new_req.block_ids[0],
                     block_size=self._block_size,
@@ -559,6 +607,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
             if new_req.req_id in self._requests_need_load:
                 meta.add_request(
                     request_id=new_req.req_id,
+                    external_req_id=new_req.external_req_id,
                     token_ids=new_req.prompt_token_ids or [],
                     block_ids=new_req.block_ids[0],
                     block_size=self._block_size,
@@ -580,14 +629,20 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 if not resumed_from_preemption:
                     block_ids = self.chunked_prefill[req_id][0] + block_ids
                 prompt_token_ids = self.chunked_prefill[req_id][1]
+                external_req_id = self.chunked_prefill[req_id][2]
                 assert prompt_token_ids is not None
                 # the request's prompt is chunked prefill again
                 if num_tokens < len(prompt_token_ids):
-                    self.chunked_prefill[req_id] = (block_ids, prompt_token_ids)
+                    self.chunked_prefill[req_id] = (
+                        block_ids,
+                        prompt_token_ids,
+                        external_req_id,
+                    )
                     continue
                 # the request's prompt is all prefilled finally
                 meta.add_request(
                     request_id=req_id,
+                    external_req_id=external_req_id,
                     token_ids=prompt_token_ids,
                     block_ids=block_ids,
                     block_size=self._block_size,
@@ -611,6 +666,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
 
                 meta.add_request(
                     request_id=req_id,
+                    external_req_id=request.external_req_id,
                     token_ids=token_ids,
                     block_ids=block_ids,
                     block_size=self._block_size,
