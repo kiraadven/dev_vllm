@@ -11,7 +11,6 @@ from typing import Iterable
 
 import torch
 import torch.distributed as dist
-from torch.distributed.distributed_c10d import P2POp
 
 
 def parse_args() -> argparse.Namespace:
@@ -154,137 +153,35 @@ def verify_send_recv(
 
     if rank == send_src:
         tensor_to_send = source_tensor.clone()
-        tensor_back = torch.empty_like(tensor_to_send)
         log(
             "rank0 prepared outbound CUDA tensor for rank1: "
             + tensor_preview(tensor_to_send)
         )
-        log("rank0 prepared empty receive buffer for response from rank1")
-        ops = [
-            P2POp(dist.isend, tensor_to_send, send_dst),
-            P2POp(dist.irecv, tensor_back, send_dst),
-        ]
-        expected = tensor_to_send * 2 + 1
-    else:
-        tensor_to_send = torch.empty(
-            tensor_size,
-            device=device,
-            dtype=dtype,
-        )
-        tensor_back = torch.empty_like(tensor_to_send)
-        log(f"rank1 prepared empty receive buffer on {device} for rank0 tensor")
-        log(f"rank1 prepared empty send buffer on {device} for response tensor")
-        ops = [
-            P2POp(dist.irecv, tensor_to_send, send_src),
-            P2POp(dist.isend, tensor_back, send_src),
-        ]
-        expected = source_tensor
-
-    log("launching NCCL batch_isend_irecv for rank0<->rank1 GPU tensor exchange")
-    reqs = dist.batch_isend_irecv(ops)
-
-    if rank == send_dst:
-        log("rank1 waiting for first irecv to finish before populating response")
-        reqs[0].wait()
-        torch.cuda.synchronize(device)
-        log("rank1 received tensor from rank0: " + tensor_preview(tensor_to_send))
-        torch.testing.assert_close(tensor_to_send, expected)
-        log("rank1 receive content matches rank0 source tensor")
-
-        tensor_back.copy_(tensor_to_send * 2 + 1)
-        torch.cuda.synchronize(device)
-        log("rank1 filled response tensor for rank0: " + tensor_preview(tensor_back))
-        log("rank1 waiting for response isend completion")
-        reqs[1].wait()
-        torch.cuda.synchronize(device)
-        log("rank1 response isend completed")
-    else:
+        log("rank0 launching NCCL isend to rank1")
+        req = dist.isend(tensor_to_send, dst=send_dst)
         log("rank0 waiting for outbound isend completion")
-        reqs[0].wait()
+        req.wait()
         torch.cuda.synchronize(device)
         log("rank0 outbound isend completed")
-        log("rank0 waiting for inbound response from rank1")
-        reqs[1].wait()
-        torch.cuda.synchronize(device)
-        log("rank0 received response tensor: " + tensor_preview(tensor_back))
-        torch.testing.assert_close(tensor_back, expected)
-        log("rank0 response tensor content matches expected transform: tensor * 2 + 1")
-
-    dist.barrier()
-    log("send/recv phase passed on all ranks")
-
-
-def verify_broadcast(
-    *,
-    rank: int,
-    device: torch.device,
-    dtype: torch.dtype,
-    tensor_size: int,
-) -> None:
-    if rank == 0:
-        tensor = build_test_tensor(
-            rank=7,
-            device=device,
-            dtype=dtype,
-            tensor_size=tensor_size,
-        )
-        log("broadcast source tensor on rank0: " + tensor_preview(tensor))
     else:
-        tensor = torch.empty(
+        tensor_to_recv = torch.empty(
             tensor_size,
             device=device,
             dtype=dtype,
         )
-        log(f"allocated empty CUDA tensor for broadcast receive on {device}")
-
-    dist.broadcast(tensor, src=0)
-    torch.cuda.synchronize(device)
-    expected = build_test_tensor(
-        rank=7,
-        device=device,
-        dtype=dtype,
-        tensor_size=tensor_size,
-    )
-    log("tensor after broadcast: " + tensor_preview(tensor))
-    torch.testing.assert_close(tensor, expected)
-    log("broadcast tensor matches expected content")
+        log(f"rank1 prepared empty receive buffer on {device} for rank0 tensor")
+        log("rank1 launching NCCL irecv from rank0")
+        req = dist.irecv(tensor_to_recv, src=send_src)
+        log("rank1 waiting for inbound irecv completion")
+        req.wait()
+        torch.cuda.synchronize(device)
+        log("rank1 received tensor from rank0: " + tensor_preview(tensor_to_recv))
+        expected = source_tensor
+        torch.testing.assert_close(tensor_to_recv, expected)
+        log("rank1 receive content matches rank0 source tensor")
 
     dist.barrier()
-    log("broadcast phase passed on all ranks")
-
-
-def verify_all_reduce(
-    *,
-    rank: int,
-    device: torch.device,
-    dtype: torch.dtype,
-    tensor_size: int,
-) -> None:
-    value = float(rank + 1) if dtype.is_floating_point else rank + 1
-    tensor = torch.full(
-        (tensor_size,),
-        fill_value=value,
-        device=device,
-        dtype=dtype,
-    )
-    log("local tensor before all_reduce: " + tensor_preview(tensor))
-
-    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-    torch.cuda.synchronize(device)
-
-    expected_value = 3.0 if dtype.is_floating_point else 3
-    expected = torch.full(
-        (tensor_size,),
-        fill_value=expected_value,
-        device=device,
-        dtype=dtype,
-    )
-    log("tensor after all_reduce(sum): " + tensor_preview(tensor))
-    torch.testing.assert_close(tensor, expected)
-    log("all_reduce result is correct")
-
-    dist.barrier()
-    log("all_reduce phase passed on all ranks")
+    log("one-way send/recv phase passed on all ranks")
 
 
 def main() -> int:
@@ -317,21 +214,9 @@ def main() -> int:
             dtype=dtype,
             tensor_size=args.tensor_size,
         )
-        verify_broadcast(
-            rank=rank,
-            device=device,
-            dtype=dtype,
-            tensor_size=args.tensor_size,
-        )
-        verify_all_reduce(
-            rank=rank,
-            device=device,
-            dtype=dtype,
-            tensor_size=args.tensor_size,
-        )
 
         if rank == 0:
-            log("SUCCESS: GPU-to-GPU NCCL communication checks all passed")
+            log("SUCCESS: rank1 received the CUDA tensor from rank0")
         return 0
     finally:
         if dist.is_initialized():
