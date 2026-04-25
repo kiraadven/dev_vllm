@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import contextlib
+import os
 import queue
 import sys
 import uuid
@@ -58,6 +59,10 @@ from vllm.v1.pool.late_interaction import get_late_interaction_engine_index
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 
 logger = init_logger(__name__)
+
+
+def _dp_trace_enabled() -> bool:
+    return os.environ.get("VLLM_DP_COORDINATOR_TRACE", "0") == "1"
 
 AnyFuture: TypeAlias = asyncio.Future[Any] | Future[Any]
 
@@ -543,6 +548,10 @@ class MPClient(EngineCoreClient):
                     assert self.stats_update_address == (
                         coordinator.get_stats_publish_address()
                     )
+                    logger.info(
+                        "MPClient received coordinator addresses: stats_update=%s",
+                        self.stats_update_address,
+                    )
 
             # Serialization setup with tensor queues for multimodal tensor IPC.
             tensor_ipc_sender: TensorIpcSender | None = None
@@ -595,6 +604,13 @@ class MPClient(EngineCoreClient):
                 self._apply_ready_response(payload)
 
             self.core_engine: EngineIdentity = self.core_engines[0]
+            logger.info(
+                "MPClient ready: engine_ranks_managed=%s stats_update_address=%s "
+                "core_engines=%s",
+                self.engine_ranks_managed,
+                self.stats_update_address,
+                [int.from_bytes(engine, "little") for engine in self.core_engines],
+            )
             self.utility_results: dict[int, AnyFuture] = {}
 
             # Request objects which may contain pytorch-allocated tensors
@@ -1198,6 +1214,13 @@ class DPAsyncMPClient(AsyncMPClient):
                 self.resources.first_req_rcv_socket = first_req_rcv_socket
                 # Send subscription message.
                 await socket.send(b"\x01")
+                logger.info(
+                    "DPAsyncMPClient stats task connected: stats_addr=%s "
+                    "first_req_sock_addr=%s managed_ranks=%s",
+                    stats_addr,
+                    self.first_req_sock_addr,
+                    self.engine_ranks_managed,
+                )
 
                 poller = zmq.asyncio.Poller()
                 poller.register(socket, zmq.POLLIN)
@@ -1258,6 +1281,12 @@ class DPAsyncMPClient(AsyncMPClient):
                         assert decoded[0] == "FIRST_REQ"
                         target_eng_index = decoded[1]
                         self.engines_running = True
+                        logger.info(
+                            "DPAsyncMPClient notifying coordinator of first request: "
+                            "target_engine=%s current_wave=%d",
+                            target_eng_index,
+                            self.current_wave,
+                        )
                         msg = msgspec.msgpack.encode(
                             (target_eng_index, self.current_wave)
                         )
@@ -1277,6 +1306,14 @@ class DPAsyncMPClient(AsyncMPClient):
                     counts, wave, running = msgspec.msgpack.decode(buf)
                     self.current_wave = wave
                     self.engines_running = running
+                    if _dp_trace_enabled():
+                        logger.info(
+                            "DPAsyncMPClient stats update: wave=%d running=%s "
+                            "counts_present=%s",
+                            wave,
+                            running,
+                            counts is not None,
+                        )
                     if counts is not None:
                         # Running and waiting counts are global from the
                         # Coordinator including all EngineCores. Slice to get
@@ -1300,6 +1337,15 @@ class DPAsyncMPClient(AsyncMPClient):
         request.client_index = self.client_index
 
         chosen_engine = self.get_core_engine_for_request(request)
+        logger.info(
+            "DPAsyncMPClient routing request: external_request_id=%s "
+            "internal_request_id=%s chosen_engine=%s wave=%d explicit_dp_rank=%s",
+            request.external_req_id,
+            request.request_id,
+            int.from_bytes(chosen_engine, "little"),
+            request.current_wave,
+            request.data_parallel_rank,
+        )
         to_await = self._send_input(EngineCoreRequestType.ADD, request, chosen_engine)
         if not self.engines_running:
             # Notify coordinator that we're sending a request

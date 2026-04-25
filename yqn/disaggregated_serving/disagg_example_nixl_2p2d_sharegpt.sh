@@ -7,34 +7,38 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 PYTHON_BIN="${ROOT_DIR}/.venv/bin/python"
 VLLM_BIN="${ROOT_DIR}/.venv/bin/vllm"
-PROXY_SCRIPT="${SCRIPT_DIR}/disagg_proxy_p2p_nccl_2p2d.py"
+PROXY_SCRIPT="${SCRIPT_DIR}/disagg_proxy_nixl_2p2d.py"
 NSYS_BIN="${NSYS_BIN:-$(command -v nsys || true)}"
 
 MODEL="${MODEL:-/data/yqn/Qwen1.5-MoE-A2.7B}"
 TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-1200}"
 
-PROXY_DISCOVERY_PORT="30001"
-PROXY_HTTP_PORT="10001"
+PROXY_HTTP_PORT="${PROXY_HTTP_PORT:-10001}"
+UCX_NET_DEVICES="${UCX_NET_DEVICES:-all}"
+UCX_TLS="${UCX_TLS:-tcp,cuda,self}"
+UCX_MEMTYPE_CACHE="${UCX_MEMTYPE_CACHE:-n}"
+NIXL_KV_BUFFER_DEVICE="${NIXL_KV_BUFFER_DEVICE:-cuda}"
+NIXL_KV_LOAD_FAILURE_POLICY="${NIXL_KV_LOAD_FAILURE_POLICY:-fail}"
 
 PREFILL_GPUS="${PREFILL_GPUS:-4,6}"
 DECODE_GPUS="${DECODE_GPUS:-5,7}"
 PREFILL_PORTS="${PREFILL_PORTS:-20003,20013}"
 DECODE_PORTS="${DECODE_PORTS:-20005,20015}"
-PREFILL_KV_PORTS="${PREFILL_KV_PORTS:-21001,21011}"
-DECODE_KV_PORTS="${DECODE_KV_PORTS:-22001,22011}"
+PREFILL_NIXL_SIDE_CHANNEL_PORTS="${PREFILL_NIXL_SIDE_CHANNEL_PORTS:-21001,21011}"
+DECODE_NIXL_SIDE_CHANNEL_PORTS="${DECODE_NIXL_SIDE_CHANNEL_PORTS:-22001,22011}"
 
 RUN_BENCHMARK="${RUN_BENCHMARK:-1}"
 BENCH_BACKEND="${BENCH_BACKEND:-openai-chat}"
 BENCH_ENDPOINT="${BENCH_ENDPOINT:-/v1/chat/completions}"
 SHAREGPT_DATASET_PATH="${SHAREGPT_DATASET_PATH:-/data/yqn/datasets/ShareGPT-X/ChatGPT-Simple.jsonl}"
-SHAREGPT_OUTPUT_LEN="${SHAREGPT_OUTPUT_LEN:-16}"
-BENCH_NUM_PROMPTS="${BENCH_NUM_PROMPTS:-2000}"
-BENCH_REQUEST_RATE="${BENCH_REQUEST_RATE:-128}"
-BENCH_BURSTINESS="${BENCH_BURSTINESS:-1.0}"
-BENCH_MAX_CONCURRENCY="${BENCH_MAX_CONCURRENCY:-2048}"
+SHAREGPT_OUTPUT_LEN="${SHAREGPT_OUTPUT_LEN:-}"
+BENCH_NUM_PROMPTS="${BENCH_NUM_PROMPTS:-1000}"
+BENCH_REQUEST_RATE="${BENCH_REQUEST_RATE:-64}"
+BENCH_BURSTINESS="${BENCH_BURSTINESS:-100}"
+BENCH_MAX_CONCURRENCY="${BENCH_MAX_CONCURRENCY:-512}"
 BENCH_SEED="${BENCH_SEED:-$(date +%s)}"
 
-LOG_DIR="${LOG_DIR:-${SCRIPT_DIR}/logs_2p2d}"
+LOG_DIR="${LOG_DIR:-${SCRIPT_DIR}/logs_2p2d_nixl}"
 DECODE_ATTN_NSYS="${DECODE_ATTN_NSYS:-1}"
 DECODE_ATTN_VERIFY="${DECODE_ATTN_VERIFY:-0}"
 DECODE_ATTN_VERIFY_MAX_LOGS="${DECODE_ATTN_VERIFY_MAX_LOGS:-50}"
@@ -53,8 +57,8 @@ declare -a PREFILL_GPU_ARRAY=()
 declare -a DECODE_GPU_ARRAY=()
 declare -a PREFILL_PORT_ARRAY=()
 declare -a DECODE_PORT_ARRAY=()
-declare -a PREFILL_KV_PORT_ARRAY=()
-declare -a DECODE_KV_PORT_ARRAY=()
+declare -a PREFILL_SIDE_CHANNEL_PORT_ARRAY=()
+declare -a DECODE_SIDE_CHANNEL_PORT_ARRAY=()
 
 parse_csv_array() {
     local -n target_array="$1"
@@ -112,8 +116,8 @@ validate_array_sizes() {
         echo "Need exactly 2 prefill API ports and 2 decode API ports."
         exit 1
     fi
-    if [[ "${#PREFILL_KV_PORT_ARRAY[@]}" -ne 2 || "${#DECODE_KV_PORT_ARRAY[@]}" -ne 2 ]]; then
-        echo "Need exactly 2 prefill KV ports and 2 decode KV ports."
+    if [[ "${#PREFILL_SIDE_CHANNEL_PORT_ARRAY[@]}" -ne 2 || "${#DECODE_SIDE_CHANNEL_PORT_ARRAY[@]}" -ne 2 ]]; then
+        echo "Need exactly 2 prefill side-channel ports and 2 decode side-channel ports."
         exit 1
     fi
 }
@@ -123,12 +127,11 @@ validate_ports() {
     local port=""
 
     for port in \
-        "${PROXY_DISCOVERY_PORT}" \
         "${PROXY_HTTP_PORT}" \
         "${PREFILL_PORT_ARRAY[@]}" \
         "${DECODE_PORT_ARRAY[@]}" \
-        "${PREFILL_KV_PORT_ARRAY[@]}" \
-        "${DECODE_KV_PORT_ARRAY[@]}"; do
+        "${PREFILL_SIDE_CHANNEL_PORT_ARRAY[@]}" \
+        "${DECODE_SIDE_CHANNEL_PORT_ARRAY[@]}"; do
         if [[ ! "${port}" =~ ^[0-9]+$ ]]; then
             echo "Invalid port: ${port}"
             exit 1
@@ -174,6 +177,17 @@ wait_for_http() {
         fi
         sleep 1
     done
+}
+
+build_nixl_kv_config() {
+    if [[ "${NIXL_KV_BUFFER_DEVICE}" == "cuda" ]]; then
+        printf '%s' \
+            "{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_both\",\"kv_load_failure_policy\":\"${NIXL_KV_LOAD_FAILURE_POLICY}\"}"
+        return 0
+    fi
+
+    printf '%s' \
+        "{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_both\",\"kv_buffer_device\":\"${NIXL_KV_BUFFER_DEVICE}\",\"kv_load_failure_policy\":\"${NIXL_KV_LOAD_FAILURE_POLICY}\"}"
 }
 
 cleanup() {
@@ -237,15 +251,21 @@ export_decode_nsys_sqlite() {
 print_config() {
     cat <<EOF
 2P2D Disaggregated Serving Configuration
+  Connector: NixlConnector
   Model: ${MODEL}
-  Proxy discovery port: ${PROXY_DISCOVERY_PORT}
   Proxy HTTP port: ${PROXY_HTTP_PORT}
+  Proxy script: ${PROXY_SCRIPT}
+  UCX_NET_DEVICES: ${UCX_NET_DEVICES}
+  UCX_TLS: ${UCX_TLS}
+  UCX_MEMTYPE_CACHE: ${UCX_MEMTYPE_CACHE}
+  NIXL kv_buffer_device: ${NIXL_KV_BUFFER_DEVICE}
+  NIXL kv_load_failure_policy: ${NIXL_KV_LOAD_FAILURE_POLICY}
   Prefill GPUs: ${PREFILL_GPUS}
   Decode GPUs: ${DECODE_GPUS}
   Prefill API ports: ${PREFILL_PORTS}
   Decode API ports: ${DECODE_PORTS}
-  Prefill KV ports: ${PREFILL_KV_PORTS}
-  Decode KV ports: ${DECODE_KV_PORTS}
+  Prefill NIXL side-channel ports: ${PREFILL_NIXL_SIDE_CHANNEL_PORTS}
+  Decode NIXL side-channel ports: ${DECODE_NIXL_SIDE_CHANNEL_PORTS}
   Benchmark enabled: ${RUN_BENCHMARK}
   ShareGPT dataset: ${SHAREGPT_DATASET_PATH}
   Logs: ${LOG_DIR}
@@ -264,23 +284,31 @@ launch_proxy() {
         "${PYTHON_BIN}" "${PROXY_SCRIPT}" \
         --host 0.0.0.0 \
         --port "${PROXY_HTTP_PORT}" \
-        --discovery-port "${PROXY_DISCOVERY_PORT}"
-    wait_for_http "http://127.0.0.1:${PROXY_HTTP_PORT}/health" "proxy"
+        --prefiller-hosts 127.0.0.1 127.0.0.1 \
+        --prefiller-ports "${PREFILL_PORT_ARRAY[@]}" \
+        --decoder-hosts 127.0.0.1 127.0.0.1 \
+        --decoder-ports "${DECODE_PORT_ARRAY[@]}"
+    wait_for_http "http://127.0.0.1:${PROXY_HTTP_PORT}/healthcheck" "proxy"
 }
 
 launch_prefill_servers() {
-    local i="" gpu_id="" api_port="" kv_port="" kv_config=""
+    local i="" gpu_id="" api_port="" side_channel_port="" kv_config=""
+
+    kv_config="$(build_nixl_kv_config)"
 
     for i in "${!PREFILL_GPU_ARRAY[@]}"; do
         gpu_id="${PREFILL_GPU_ARRAY[$i]}"
         api_port="${PREFILL_PORT_ARRAY[$i]}"
-        kv_port="${PREFILL_KV_PORT_ARRAY[$i]}"
-        kv_config="{\"kv_connector\":\"P2pNcclConnector\",\"kv_role\":\"kv_producer\",\"kv_buffer_size\":\"1e1\",\"kv_port\":\"${kv_port}\",\"kv_connector_extra_config\":{\"proxy_ip\":\"0.0.0.0\",\"proxy_port\":\"${PROXY_DISCOVERY_PORT}\",\"http_port\":\"${api_port}\",\"send_type\":\"PUT_ASYNC\",\"nccl_num_channels\":\"16\"}}"
+        side_channel_port="${PREFILL_SIDE_CHANNEL_PORT_ARRAY[$i]}"
 
-        echo "Starting prefill $((i + 1)): GPU=${gpu_id}, api_port=${api_port}, kv_port=${kv_port}"
+        echo "Starting prefill $((i + 1)): GPU=${gpu_id}, api_port=${api_port}, side_channel_port=${side_channel_port}"
         launch_in_new_session "${LOG_DIR}/prefill$((i + 1)).log" \
             env \
             VLLM_ENGINE_READY_TIMEOUT_S="${TIMEOUT_SECONDS}" \
+            UCX_NET_DEVICES="${UCX_NET_DEVICES}" \
+            UCX_TLS="${UCX_TLS}" \
+            UCX_MEMTYPE_CACHE="${UCX_MEMTYPE_CACHE}" \
+            VLLM_NIXL_SIDE_CHANNEL_PORT="${side_channel_port}" \
             CUDA_VISIBLE_DEVICES="${gpu_id}" \
             "${VLLM_BIN}" serve "${MODEL}" \
             --enforce-eager \
@@ -293,7 +321,7 @@ launch_prefill_servers() {
             --max-num-batched-tokens 10000 \
             --max-num-seqs 256 \
             --trust-remote-code \
-            --gpu-memory-utilization 0.9 \
+            --gpu-memory-utilization 0.8 \
             --kv-transfer-config "${kv_config}"
     done
 
@@ -303,8 +331,9 @@ launch_prefill_servers() {
 }
 
 launch_decode_servers() {
-    local i="" gpu_id="" api_port="" kv_port="" kv_config=""
+    local i="" gpu_id="" api_port="" side_channel_port="" kv_config=""
 
+    kv_config="$(build_nixl_kv_config)"
     if [[ "${DECODE_ATTN_NSYS}" == "1" ]]; then
         mkdir -p "${DECODE_ATTN_NSYS_DIR}"
     fi
@@ -312,14 +341,17 @@ launch_decode_servers() {
     for i in "${!DECODE_GPU_ARRAY[@]}"; do
         gpu_id="${DECODE_GPU_ARRAY[$i]}"
         api_port="${DECODE_PORT_ARRAY[$i]}"
-        kv_port="${DECODE_KV_PORT_ARRAY[$i]}"
-        kv_config="{\"kv_connector\":\"P2pNcclConnector\",\"kv_role\":\"kv_consumer\",\"kv_buffer_size\":\"8e9\",\"kv_port\":\"${kv_port}\",\"kv_connector_extra_config\":{\"proxy_ip\":\"0.0.0.0\",\"proxy_port\":\"${PROXY_DISCOVERY_PORT}\",\"http_port\":\"${api_port}\",\"send_type\":\"PUT_ASYNC\",\"nccl_num_channels\":\"16\"}}"
+        side_channel_port="${DECODE_SIDE_CHANNEL_PORT_ARRAY[$i]}"
 
-        echo "Starting decode $((i + 1)): GPU=${gpu_id}, api_port=${api_port}, kv_port=${kv_port}"
+        echo "Starting decode $((i + 1)): GPU=${gpu_id}, api_port=${api_port}, side_channel_port=${side_channel_port}"
         if [[ "${DECODE_ATTN_NSYS}" == "1" ]]; then
             launch_in_new_session "${LOG_DIR}/decode$((i + 1)).log" \
                 env \
                 VLLM_ENGINE_READY_TIMEOUT_S="${TIMEOUT_SECONDS}" \
+                UCX_NET_DEVICES="${UCX_NET_DEVICES}" \
+                UCX_TLS="${UCX_TLS}" \
+                UCX_MEMTYPE_CACHE="${UCX_MEMTYPE_CACHE}" \
+                VLLM_NIXL_SIDE_CHANNEL_PORT="${side_channel_port}" \
                 VLLM_QWEN2MOE_DECODE_ATTN_NVTX="1" \
                 VLLM_QWEN2MOE_DECODE_ATTN_VERIFY="${DECODE_ATTN_VERIFY}" \
                 VLLM_QWEN2MOE_DECODE_ATTN_VERIFY_MAX_LOGS="${DECODE_ATTN_VERIFY_MAX_LOGS}" \
@@ -327,8 +359,6 @@ launch_decode_servers() {
                 "${NSYS_BIN}" profile \
                 --trace "${DECODE_ATTN_NSYS_TRACE}" \
                 --sample "${DECODE_ATTN_NSYS_SAMPLE}" \
-                --trace-fork-before-exec "${DECODE_ATTN_NSYS_TRACE_FORK_BEFORE_EXEC}" \
-                --wait "${DECODE_ATTN_NSYS_WAIT}" \
                 --force-overwrite true \
                 --output "${DECODE_ATTN_NSYS_DIR}/decode$((i + 1))" \
                 "${VLLM_BIN}" serve "${MODEL}" \
@@ -342,12 +372,16 @@ launch_decode_servers() {
                 --max-num-batched-tokens 10000 \
                 --max-num-seqs 256 \
                 --trust-remote-code \
-                --gpu-memory-utilization 0.7 \
+                --gpu-memory-utilization 0.8 \
                 --kv-transfer-config "${kv_config}"
         else
             launch_in_new_session "${LOG_DIR}/decode$((i + 1)).log" \
                 env \
                 VLLM_ENGINE_READY_TIMEOUT_S="${TIMEOUT_SECONDS}" \
+                UCX_NET_DEVICES="${UCX_NET_DEVICES}" \
+                UCX_TLS="${UCX_TLS}" \
+                UCX_MEMTYPE_CACHE="${UCX_MEMTYPE_CACHE}" \
+                VLLM_NIXL_SIDE_CHANNEL_PORT="${side_channel_port}" \
                 VLLM_QWEN2MOE_DECODE_ATTN_NVTX="0" \
                 VLLM_QWEN2MOE_DECODE_ATTN_VERIFY="${DECODE_ATTN_VERIFY}" \
                 VLLM_QWEN2MOE_DECODE_ATTN_VERIFY_MAX_LOGS="${DECODE_ATTN_VERIFY_MAX_LOGS}" \
@@ -401,16 +435,17 @@ main() {
     mkdir -p "${LOG_DIR}"
 
     check_required_files
-    ensure_python_module_installed msgpack
     ensure_python_module_installed pandas
     ensure_python_module_installed datasets
+    ensure_python_module_installed msgpack
+    ensure_python_module_installed nixl
 
     parse_csv_array PREFILL_GPU_ARRAY "${PREFILL_GPUS}"
     parse_csv_array DECODE_GPU_ARRAY "${DECODE_GPUS}"
     parse_csv_array PREFILL_PORT_ARRAY "${PREFILL_PORTS}"
     parse_csv_array DECODE_PORT_ARRAY "${DECODE_PORTS}"
-    parse_csv_array PREFILL_KV_PORT_ARRAY "${PREFILL_KV_PORTS}"
-    parse_csv_array DECODE_KV_PORT_ARRAY "${DECODE_KV_PORTS}"
+    parse_csv_array PREFILL_SIDE_CHANNEL_PORT_ARRAY "${PREFILL_NIXL_SIDE_CHANNEL_PORTS}"
+    parse_csv_array DECODE_SIDE_CHANNEL_PORT_ARRAY "${DECODE_NIXL_SIDE_CHANNEL_PORTS}"
 
     validate_array_sizes
     validate_ports

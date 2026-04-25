@@ -486,6 +486,12 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
+    _log(
+        "proxy_starting",
+        host=args.host,
+        port=args.port,
+        discovery_port=args.discovery_port,
+    )
     listener_thread = start_service_discovery(args.host, args.discovery_port)
 
     import uvicorn

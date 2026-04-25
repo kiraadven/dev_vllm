@@ -86,6 +86,10 @@ HANDSHAKE_TIMEOUT_MINS = 5
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 
+def _dp_trace_enabled() -> bool:
+    return os.environ.get("VLLM_DP_COORDINATOR_TRACE", "0") == "1"
+
+
 class EngineCore:
     """Inner loop of vLLM's Engine."""
 
@@ -1380,6 +1384,15 @@ class EngineCoreProc(EngineCore):
         )
         generic_decoder = MsgpackDecoder(oob_tensor_provider=self.tensor_ipc_receiver)
 
+        logger.info(
+            "EngineCore input sockets starting: engine_index=%d identity=%d "
+            "input_addresses=%s coord_input_address=%s",
+            self.engine_index,
+            int.from_bytes(identity, "little"),
+            input_addresses,
+            coord_input_address,
+        )
+
         with ExitStack() as stack, zmq.Context() as ctx:
             input_sockets = [
                 stack.enter_context(
@@ -1403,6 +1416,12 @@ class EngineCoreProc(EngineCore):
                 )
                 # Send subscription message to coordinator.
                 coord_socket.send(b"\x01")
+                logger.info(
+                    "EngineCore subscribed to coordinator input: engine_index=%d "
+                    "coord_input_address=%s",
+                    self.engine_index,
+                    coord_input_address,
+                )
 
             # Register sockets with poller.
             poller = zmq.Poller()
@@ -1422,6 +1441,10 @@ class EngineCoreProc(EngineCore):
             if coord_socket is not None:
                 # Wait for ready message from coordinator.
                 assert coord_socket.recv() == b"READY"
+                logger.info(
+                    "EngineCore received coordinator READY: engine_index=%d",
+                    self.engine_index,
+                )
                 poller.register(coord_socket, zmq.POLLIN)
 
             ready_event.set()
@@ -1434,8 +1457,21 @@ class EngineCoreProc(EngineCore):
                     # that is used to notify newly started engines
                     if type_frame.buffer == b"READY":
                         assert input_socket == coord_socket
+                        logger.info(
+                            "EngineCore received repeated coordinator READY: "
+                            "engine_index=%d",
+                            self.engine_index,
+                        )
                         continue
                     request_type = EngineCoreRequestType(bytes(type_frame.buffer))
+                    if _dp_trace_enabled():
+                        logger.info(
+                            "EngineCore input message: engine_index=%d "
+                            "request_type=%s from_coordinator=%s",
+                            self.engine_index,
+                            request_type.name,
+                            input_socket == coord_socket,
+                        )
 
                     # Deserialize the request data.
                     request: Any
@@ -1507,6 +1543,15 @@ class EngineCoreProc(EngineCore):
                     # Don't reuse buffer for coordinator message
                     # which will be very small.
                     assert coord_socket is not None
+                    if _dp_trace_enabled():
+                        logger.info(
+                            "EngineCore sending coordinator output: engine_index=%d "
+                            "wave_complete=%s start_wave=%s has_stats=%s",
+                            engine_index,
+                            outputs.wave_complete,
+                            outputs.start_wave,
+                            outputs.scheduler_stats is not None,
+                        )
                     coord_socket.send_multipart(encoder.encode(outputs))
                     continue
 

@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+import logging
 import multiprocessing
 import multiprocessing.connection
+import os
 import time
 import weakref
 
@@ -18,6 +20,42 @@ from vllm.v1.serial_utils import MsgpackDecoder
 from vllm.v1.utils import get_engine_client_zmq_addr, shutdown
 
 logger = init_logger(__name__)
+
+_COORD_TRACE_ENV = "VLLM_DP_COORDINATOR_TRACE"
+_COORD_LOG_PATH_ENV = "VLLM_DP_COORDINATOR_LOG_PATH"
+
+
+def _coord_trace_enabled() -> bool:
+    return os.environ.get(_COORD_TRACE_ENV, "0") == "1"
+
+
+def _maybe_add_coordinator_file_handler() -> None:
+    log_path = os.environ.get(_COORD_LOG_PATH_ENV)
+    if not log_path:
+        return
+
+    handler_attr = "_vllm_dp_coord_file_handler"
+    if getattr(logger, handler_attr, None) is not None:
+        return
+
+    directory = os.path.dirname(log_path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(
+        logging.Formatter(
+            fmt=(
+                "%(levelname)s %(asctime)s "
+                "[%(processName)s %(name)s:%(lineno)d] %(message)s"
+            ),
+            datefmt="%m-%d %H:%M:%S",
+        )
+    )
+    logger.addHandler(handler)
+    setattr(logger, handler_attr, handler)
+    logger.info("DP Coordinator file logging enabled at %s", log_path)
 
 
 class DPCoordinator:
@@ -128,6 +166,16 @@ class DPCoordinator:
         self.stats_publish_address = front_publish_address # XPUB socket for publishing stats to front-ends
         self.coord_in_address = back_publish_address # XPUB socket for sending control messages to engines
         self.coord_out_address = back_output_address # PULL socket for receiving messages from engines
+        logger.info(
+            "DP Coordinator online: pid=%d stats_publish=%s coord_in=%s "
+            "coord_out=%s enable_wave_coordination=%s dp_size=%d",
+            self.proc.pid,
+            self.stats_publish_address,
+            self.coord_in_address,
+            self.coord_out_address,
+            enable_wave_coordination,
+            dp_size,
+        )
         self._finalizer = weakref.finalize(self, shutdown, [self.proc])
 
     def get_stats_publish_address(self) -> str:
@@ -173,6 +221,17 @@ class DPCoordinatorProc:
         min_stats_update_interval_ms: int = 100,
         enable_wave_coordination: bool = True,
     ):
+        _maybe_add_coordinator_file_handler()
+        logger.info(
+            "Starting DP Coordinator process: engine_count=%d "
+            "front_publish_address=%s back_output_address=%s "
+            "back_publish_address=%s enable_wave_coordination=%s",
+            engine_count,
+            front_publish_address,
+            back_output_address,
+            back_publish_address,
+            enable_wave_coordination,
+        )
         coordinator = DPCoordinatorProc(
             engine_count=engine_count,
             min_stats_update_interval_ms=min_stats_update_interval_ms,
@@ -230,6 +289,13 @@ class DPCoordinatorProc:
                 bind=True,
             ) as publish_back,
         ):
+            logger.info(
+                "DP Coordinator sockets bound: publish_front=%s output_back=%s "
+                "publish_back=%s",
+                publish_front.getsockopt(zmq.LAST_ENDPOINT).decode(),
+                output_back.getsockopt(zmq.LAST_ENDPOINT).decode(),
+                publish_back.getsockopt(zmq.LAST_ENDPOINT).decode(),
+            )
             if zmq_addr_pipe is not None:
                 try:
                     zmq_addr_pipe.send(
@@ -242,13 +308,18 @@ class DPCoordinatorProc:
                 finally:
                     zmq_addr_pipe.close()
             # Wait until all engines subscribe.
-            for _ in self.engines:
+            for idx in range(len(self.engines)):
                 if publish_back.recv() != b"\x01":
                     logger.error(
                         "DP Coordinator received unexpected message while "
                         "waiting for engines to subscribe"
                     )
                     return
+                logger.info(
+                    "DP Coordinator engine subscription received: %d/%d",
+                    idx + 1,
+                    len(self.engines),
+                )
             # Send ready message to engines.
             publish_back.send(b"READY")
 
@@ -297,6 +368,10 @@ class DPCoordinatorProc:
                         # new engines finished initialization.
                         # Subscription message, on the other hand, is sent
                         # by each engine during initialization
+                        logger.info(
+                            "DP Coordinator received new engine subscription; "
+                            "sending READY"
+                        )
                         publish_back.send(b"READY")
                     elif buffer != b"\x00":
                         logger.error(
@@ -353,6 +428,14 @@ class DPCoordinatorProc:
                         # engines are paused, so that we can wake the other
                         # engines.
                         engine_to_exclude, wave = decoded
+                        logger.info(
+                            "DP Coordinator frontend wakeup: engine_to_exclude=%s "
+                            "wave=%d engines_running=%s current_wave=%d",
+                            engine_to_exclude,
+                            wave,
+                            engines_running,
+                            current_wave,
+                        )
                         if not engines_running:
                             if wave < current_wave:
                                 # If the wave number is stale, ensure the message
@@ -407,6 +490,16 @@ class DPCoordinatorProc:
                         stats[0] = scheduler_stats.num_waiting_reqs
                         stats[1] = scheduler_stats.num_running_reqs
                         stats_changed = True
+                        if _coord_trace_enabled():
+                            logger.info(
+                                "DP Coordinator stats update: engine=%d wave=%d "
+                                "step=%d waiting=%d running=%d",
+                                eng_index,
+                                scheduler_stats.current_wave,
+                                scheduler_stats.step_counter,
+                                scheduler_stats.num_waiting_reqs,
+                                scheduler_stats.num_running_reqs,
+                            )
 
                     # Wave coordination: handle wave completion and start notifications
                     # Only process these when wave coordination is enabled
@@ -419,6 +512,13 @@ class DPCoordinatorProc:
                                 new_wave = wave + 1
                                 logger.debug(
                                     "Moving DP wave from %d to %d.",
+                                    current_wave,
+                                    new_wave,
+                                )
+                                logger.info(
+                                    "DP Coordinator wave complete from engine=%d: "
+                                    "old_wave=%d new_wave=%d",
+                                    eng_index,
                                     current_wave,
                                     new_wave,
                                 )
@@ -437,12 +537,25 @@ class DPCoordinatorProc:
                                 "stale wave request from engine.",
                                 wave,
                             )
+                            logger.info(
+                                "DP Coordinator stale-wave wakeup from engine=%d: "
+                                "new_wave=%d old_wave=%d",
+                                eng_index,
+                                wave,
+                                current_wave,
+                            )
                             current_wave = wave
                             engines_running = True
                             wave_state_changed = True
                             self._send_start_wave(publish_back, wave, eng_index)
 
                 if wave_state_changed:
+                    logger.info(
+                        "DP Coordinator publishing wave state: current_wave=%d "
+                        "engines_running=%s",
+                        current_wave,
+                        engines_running,
+                    )
                     message = (None, current_wave, engines_running)
                     publish_front.send(msgspec.msgpack.encode(message))
 
@@ -455,6 +568,11 @@ class DPCoordinatorProc:
         has already received a request with this wave number and so doesn't
         require additional notification.
         """
+        logger.info(
+            "DP Coordinator send START_DP_WAVE: wave=%d exclude_engine_index=%s",
+            wave,
+            exclude_engine_index,
+        )
         wave_encoded = msgspec.msgpack.encode((wave, exclude_engine_index))
         socket.send_multipart((EngineCoreRequestType.START_DP_WAVE.value, wave_encoded))
 

@@ -1007,7 +1007,14 @@ def launch_core_engines(
             coordinator.get_stats_publish_address()
         )
 
-        logger.info("Started DP Coordinator process (PID: %d)", coordinator.proc.pid)
+        logger.info(
+            "Started DP Coordinator process (PID: %d), stats_publish=%s "
+            "coord_in=%s coord_out=%s",
+            coordinator.proc.pid,
+            addresses.frontend_stats_publish_address,
+            addresses.coordinator_input,
+            addresses.coordinator_output,
+        )
     else:
         coordinator = None
 
