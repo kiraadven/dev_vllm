@@ -293,7 +293,7 @@ launch_prefill_servers() {
             --max-num-batched-tokens 10000 \
             --max-num-seqs 256 \
             --trust-remote-code \
-            --gpu-memory-utilization 0.9 \
+            --gpu-memory-utilization 0.7 \
             --kv-transfer-config "${kv_config}"
     done
 

@@ -321,7 +321,7 @@ launch_prefill_servers() {
             --max-num-batched-tokens 10000 \
             --max-num-seqs 256 \
             --trust-remote-code \
-            --gpu-memory-utilization 0.8 \
+            --gpu-memory-utilization 0.7 \
             --kv-transfer-config "${kv_config}"
     done
 
@@ -374,7 +374,7 @@ launch_decode_servers() {
                 --max-num-batched-tokens 10000 \
                 --max-num-seqs 256 \
                 --trust-remote-code \
-                --gpu-memory-utilization 0.8 \
+                --gpu-memory-utilization 0.7 \
                 --kv-transfer-config "${kv_config}"
         else
             launch_in_new_session "${LOG_DIR}/decode$((i + 1)).log" \
