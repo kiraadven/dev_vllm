@@ -37,22 +37,27 @@ BENCH_BACKEND="${BENCH_BACKEND:-openai-chat}"
 BENCH_ENDPOINT="${BENCH_ENDPOINT:-/v1/chat/completions}"
 SHAREGPT_DATASET_PATH="${SHAREGPT_DATASET_PATH:-/data/yqn/datasets/ShareGPT-X/ChatGPT-Simple.jsonl}"
 SHAREGPT_OUTPUT_LEN="${SHAREGPT_OUTPUT_LEN:-}"
-BENCH_NUM_PROMPTS="${BENCH_NUM_PROMPTS:-1000}"
-BENCH_REQUEST_RATE="${BENCH_REQUEST_RATE:-64}"
-BENCH_BURSTINESS="${BENCH_BURSTINESS:-100}"
+BENCH_NUM_PROMPTS="${BENCH_NUM_PROMPTS:-2000}"
+BENCH_REQUEST_RATE="${BENCH_REQUEST_RATE:-256}"
+BENCH_BURSTINESS="${BENCH_BURSTINESS:-0.8}"
 BENCH_MAX_CONCURRENCY="${BENCH_MAX_CONCURRENCY:-512}"
 BENCH_SEED="${BENCH_SEED:-$(date +%s)}"
 DP_COORDINATOR_TRACE="${DP_COORDINATOR_TRACE:-1}"
 
 LOG_DIR="${LOG_DIR:-${SCRIPT_DIR}/logs_dp_2p2d_nixl}"
+STEP_PROFILER_DIR="${STEP_PROFILER_DIR:-${LOG_DIR}/step_profiler}"
 DECODE_ATTN_NSYS="${DECODE_ATTN_NSYS:-1}"
-DECODE_ATTN_VERIFY="${DECODE_ATTN_VERIFY:-1}"
+DECODE_ATTN_VERIFY="${DECODE_ATTN_VERIFY:-0}"
 DECODE_ATTN_VERIFY_MAX_LOGS="${DECODE_ATTN_VERIFY_MAX_LOGS:-1000000}"
 DECODE_ATTN_NSYS_DIR="${DECODE_ATTN_NSYS_DIR:-${LOG_DIR}/decode_attn_nsys}"
 DECODE_ATTN_NSYS_TRACE="${DECODE_ATTN_NSYS_TRACE:-cuda,nvtx,osrt}"
 DECODE_ATTN_NSYS_SAMPLE="${DECODE_ATTN_NSYS_SAMPLE:-none}"
 DECODE_ATTN_NSYS_TRACE_FORK_BEFORE_EXEC="${DECODE_ATTN_NSYS_TRACE_FORK_BEFORE_EXEC:-true}"
 DECODE_ATTN_NSYS_WAIT="${DECODE_ATTN_NSYS_WAIT:-all}"
+CLEANUP_GRACE_SECONDS="${CLEANUP_GRACE_SECONDS:-10}"
+NSYS_CLEANUP_GRACE_SECONDS="${NSYS_CLEANUP_GRACE_SECONDS:-120}"
+NSYS_REPORT_STABLE_POLLS="${NSYS_REPORT_STABLE_POLLS:-3}"
+NSYS_REPORT_STABLE_INTERVAL_SECONDS="${NSYS_REPORT_STABLE_INTERVAL_SECONDS:-2}"
 
 export NO_PROXY="127.0.0.1,localhost,0.0.0.0,${NO_PROXY:-}"
 export no_proxy="${NO_PROXY}"
@@ -224,15 +229,24 @@ build_nixl_kv_config() {
 }
 
 cleanup() {
-    local pid=""
-    local deadline=""
     trap - EXIT INT TERM
     echo "Cleaning up processes..."
+
+    local grace="${CLEANUP_GRACE_SECONDS}"
+    if [[ "${DECODE_ATTN_NSYS}" == "1" ]]; then
+        grace="${NSYS_CLEANUP_GRACE_SECONDS}"
+    fi
+
+    # SIGTERM for graceful shutdown.
+    # - vLLM's SIGTERM handler dumps step-profiler CSV then re-raises.
+    # - nsys finalizes .nsys-rep on SIGTERM of its child.
     for pid in "${PIDS[@]:-}"; do
         kill -TERM -- "-${pid}" >/dev/null 2>&1 || true
         kill -TERM "${pid}" >/dev/null 2>&1 || true
     done
-    deadline=$((SECONDS + 10))
+
+    # Wait up to $grace seconds for processes to exit.
+    local deadline=$((SECONDS + grace))
     while (( SECONDS < deadline )); do
         local any_alive=0
         for pid in "${PIDS[@]:-}"; do
@@ -241,17 +255,42 @@ cleanup() {
                 break
             fi
         done
-        if (( any_alive == 0 )); then
-            break
-        fi
+        (( any_alive == 0 )) && break
         sleep 1
     done
+
+    # Force-kill stragglers.
     for pid in "${PIDS[@]:-}"; do
         kill -KILL -- "-${pid}" >/dev/null 2>&1 || true
         kill -KILL "${pid}" >/dev/null 2>&1 || true
         wait "${pid}" >/dev/null 2>&1 || true
     done
+
     export_decode_nsys_sqlite
+}
+
+wait_for_stable_file() {
+    local path="$1"
+    local stable_polls="${2:-3}"
+    local interval_seconds="${3:-2}"
+    local stable_count=0
+    local prev_size="-1"
+    local current_size=""
+
+    if [[ ! -f "${path}" ]]; then
+        return 1
+    fi
+
+    while (( stable_count < stable_polls )); do
+        current_size="$(stat -c '%s' "${path}" 2>/dev/null || echo -1)"
+        if [[ "${current_size}" == "${prev_size}" && "${current_size}" != "-1" ]]; then
+            stable_count=$((stable_count + 1))
+        else
+            stable_count=0
+            prev_size="${current_size}"
+        fi
+        sleep "${interval_seconds}"
+    done
 }
 
 export_decode_nsys_sqlite() {
@@ -271,6 +310,11 @@ export_decode_nsys_sqlite() {
             echo "Skipping missing report: ${rep_path}"
             continue
         fi
+        echo "  Waiting for stable report file: ${rep_path}"
+        wait_for_stable_file \
+            "${rep_path}" \
+            "${NSYS_REPORT_STABLE_POLLS}" \
+            "${NSYS_REPORT_STABLE_INTERVAL_SECONDS}"
         echo "  ${rep_path} -> ${sqlite_path}"
         "${NSYS_BIN}" export \
             --type sqlite \
@@ -308,6 +352,7 @@ Prefill-DP 2P2D Disaggregated Serving Configuration
   Benchmark enabled: ${RUN_BENCHMARK}
   ShareGPT dataset: ${SHAREGPT_DATASET_PATH}
   Logs: ${LOG_DIR}
+  Step profiler dir: ${STEP_PROFILER_DIR}
   Coordinator log: ${LOG_DIR}/dp_coordinator.log
   Decode attention nsys: ${DECODE_ATTN_NSYS}
   Decode attention verify: ${DECODE_ATTN_VERIFY}
@@ -340,6 +385,7 @@ launch_prefill_dp_servers() {
     echo "Starting prefill internal-LB server: GPUs=${PREFILL_DP_GPUS}, api_port=${api_port}, side_channel_base_port=${PREFILL_DP_NIXL_SIDE_CHANNEL_BASE_PORT}"
     launch_in_new_session "${LOG_DIR}/prefill_internal_lb.log" \
         env \
+        VLLM_STEP_PROFILER_OUTPUT="${STEP_PROFILER_DIR}/prefill_internal_lb.csv" \
         VLLM_ENGINE_READY_TIMEOUT_S="${TIMEOUT_SECONDS}" \
         VLLM_DP_COORDINATOR_TRACE="${DP_COORDINATOR_TRACE}" \
         VLLM_DP_COORDINATOR_LOG_PATH="${LOG_DIR}/dp_coordinator.log" \
@@ -387,6 +433,7 @@ launch_decode_servers() {
         if [[ "${DECODE_ATTN_NSYS}" == "1" ]]; then
             launch_in_new_session "${LOG_DIR}/decode$((i + 1)).log" \
                 env \
+                VLLM_STEP_PROFILER_OUTPUT="${STEP_PROFILER_DIR}/decode$((i + 1)).csv" \
                 VLLM_ENGINE_READY_TIMEOUT_S="${TIMEOUT_SECONDS}" \
                 UCX_NET_DEVICES="${UCX_NET_DEVICES}" \
                 UCX_TLS="${UCX_TLS}" \
@@ -416,11 +463,12 @@ launch_decode_servers() {
                 --max-num-batched-tokens 10000 \
                 --max-num-seqs 256 \
                 --trust-remote-code \
-                --gpu-memory-utilization 0.7 \
+                --gpu-memory-utilization 0.9 \
                 --kv-transfer-config "${kv_config}"
         else
             launch_in_new_session "${LOG_DIR}/decode$((i + 1)).log" \
                 env \
+                VLLM_STEP_PROFILER_OUTPUT="${STEP_PROFILER_DIR}/decode$((i + 1)).csv" \
                 VLLM_ENGINE_READY_TIMEOUT_S="${TIMEOUT_SECONDS}" \
                 UCX_NET_DEVICES="${UCX_NET_DEVICES}" \
                 UCX_TLS="${UCX_TLS}" \
@@ -443,7 +491,7 @@ launch_decode_servers() {
                 --max-num-batched-tokens 10000 \
                 --max-num-seqs 256 \
                 --trust-remote-code \
-                --gpu-memory-utilization 0.7 \
+                --gpu-memory-utilization 0.9 \
                 --kv-transfer-config "${kv_config}"
         fi
     done
@@ -479,6 +527,7 @@ run_sharegpt_benchmark() {
 main() {
     trap cleanup EXIT INT TERM
     mkdir -p "${LOG_DIR}"
+    mkdir -p "${STEP_PROFILER_DIR}"
 
     check_required_files
     ensure_python_module_installed msgpack

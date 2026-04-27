@@ -109,6 +109,10 @@ ipython_config.py
 # uv
 uv.lock
 
+logs*
+
+figures/
+
 *.nsys-rep
 *.sqlite
 

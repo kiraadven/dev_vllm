@@ -1437,11 +1437,19 @@ class ShareGPTDataset(BenchmarkDataset):
             prompt_ids = tokenizer(prompt).input_ids
             completion_ids = tokenizer(completion).input_ids
             prompt_len = len(prompt_ids)
-            new_output_len = len(completion_ids) if output_len is None else output_len
+            base_output_len = (
+                len(completion_ids) if output_len is None else output_len
+            )
+            # Reduce ShareGPT completion lengths aggressively to avoid
+            # overlong decode phases during serving benchmarks.
+            # new_output_len = max(1, base_output_len // 10)
+            new_output_len = base_output_len
             if not is_valid_sequence(
                 prompt_len,
                 new_output_len,
-                skip_min_output_len_check=output_len is not None,
+                max_prompt_len=8192,
+                max_total_len=8192,
+                skip_min_output_len_check=True,
             ):
                 continue
             if image_path := entry.get("image"):
