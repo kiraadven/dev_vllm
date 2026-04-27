@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import atexit
-import csv
 import os
 import queue
 import signal
@@ -90,16 +88,6 @@ _R = TypeVar("_R")  # Return type for collective_rpc
 
 def _dp_trace_enabled() -> bool:
     return os.environ.get("VLLM_DP_COORDINATOR_TRACE", "0") == "1"
-
-
-# ---------------------------------------------------------------------------
-# Lightweight step interval recorder.
-# Set VLLM_STEP_PROFILER_OUTPUT=/path/to/file.csv to enable.
-# Each step appends one row: (step_index, timestamp_mono, interval_ms,
-#     has_new_req, num_scheduled_tokens, num_requests).
-# When disabled (default), the only overhead is one `if False` per step.
-# ---------------------------------------------------------------------------
-_STEP_PROFILER_OUTPUT = os.environ.get("VLLM_STEP_PROFILER_OUTPUT", "")
 
 
 class EngineCore:
@@ -233,15 +221,6 @@ class EngineCore:
         self.aborts_queue = queue.Queue[list[str]]()
 
         self._idle_state_callbacks: list[Callable] = []
-
-        # Step interval profiler (lightweight).
-        self._step_profiler_enabled = bool(_STEP_PROFILER_OUTPUT)
-        self._step_profiler_dumped = False
-        self._step_records: list[tuple] = []  # collected in-memory
-        self._step_index = 0
-        self._last_step_end: float = 0.0
-        if self._step_profiler_enabled:
-            atexit.register(self._dump_step_profiler)
 
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
@@ -438,13 +417,6 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule()
-
-        # --- record step interval ---
-        if self._step_profiler_enabled:
-            now = time.monotonic()
-            interval_ms = ((now - self._last_step_end) * 1000
-                           if self._last_step_end > 0 else 0.0)
-
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -461,18 +433,6 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
-
-        # --- finish recording ---
-        if self._step_profiler_enabled:
-            self._last_step_end = time.monotonic()
-            has_new_req = len(scheduler_output.scheduled_new_reqs) > 0
-            num_tokens = scheduler_output.total_num_scheduled_tokens
-            num_reqs = len(scheduler_output.num_scheduled_tokens)
-            self._step_records.append((
-                self._step_index, self._last_step_end, interval_ms,
-                has_new_req, num_tokens, num_reqs,
-            ))
-            self._step_index += 1
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
@@ -615,44 +575,11 @@ class EngineCore:
             self.abort_requests(request_ids)
 
     def shutdown(self):
-        # Dump step profiler data before tearing down.
-        self._dump_step_profiler()
-
         self.structured_output_manager.clear_backend()
         if self.model_executor:
             self.model_executor.shutdown()
         if self.scheduler:
             self.scheduler.shutdown()
-
-    def _dump_step_profiler(self):
-        """Write step interval records to CSV if profiling was enabled.
-
-        Idempotent: called from both shutdown() and atexit.  The atexit
-        hook guarantees the CSV is written even when the process is killed
-        by SIGTERM (e.g. nsys wrapper killed by the benchmark harness)
-        before shutdown() gets a chance to run.
-        """
-        if self._step_profiler_dumped:
-            return
-        if not self._step_profiler_enabled or not self._step_records:
-            return
-        self._step_profiler_dumped = True
-        output_path = _STEP_PROFILER_OUTPUT
-        try:
-            os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            with open(output_path, "w", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    "step_index", "timestamp_mono", "interval_ms",
-                    "has_new_req", "num_scheduled_tokens", "num_requests",
-                ])
-                writer.writerows(self._step_records)
-            logger.info(
-                "[StepProfiler] %d records saved to %s",
-                len(self._step_records), output_path,
-            )
-        except Exception:
-            logger.exception("[StepProfiler] Failed to write %s", output_path)
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         self.model_executor.profile(is_start, profile_prefix)

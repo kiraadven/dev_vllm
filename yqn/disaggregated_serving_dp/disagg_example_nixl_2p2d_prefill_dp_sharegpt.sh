@@ -38,14 +38,13 @@ BENCH_ENDPOINT="${BENCH_ENDPOINT:-/v1/chat/completions}"
 SHAREGPT_DATASET_PATH="${SHAREGPT_DATASET_PATH:-/data/yqn/datasets/ShareGPT-X/ChatGPT-Simple.jsonl}"
 SHAREGPT_OUTPUT_LEN="${SHAREGPT_OUTPUT_LEN:-}"
 BENCH_NUM_PROMPTS="${BENCH_NUM_PROMPTS:-2000}"
-BENCH_REQUEST_RATE="${BENCH_REQUEST_RATE:-256}"
-BENCH_BURSTINESS="${BENCH_BURSTINESS:-0.8}"
-BENCH_MAX_CONCURRENCY="${BENCH_MAX_CONCURRENCY:-512}"
+BENCH_REQUEST_RATE="${BENCH_REQUEST_RATE:-512}"
+BENCH_BURSTINESS="${BENCH_BURSTINESS:-0.5}"
+BENCH_MAX_CONCURRENCY="${BENCH_MAX_CONCURRENCY:-1024}"
 BENCH_SEED="${BENCH_SEED:-$(date +%s)}"
 DP_COORDINATOR_TRACE="${DP_COORDINATOR_TRACE:-1}"
 
 LOG_DIR="${LOG_DIR:-${SCRIPT_DIR}/logs_dp_2p2d_nixl}"
-STEP_PROFILER_DIR="${STEP_PROFILER_DIR:-${LOG_DIR}/step_profiler}"
 DECODE_ATTN_NSYS="${DECODE_ATTN_NSYS:-1}"
 DECODE_ATTN_VERIFY="${DECODE_ATTN_VERIFY:-0}"
 DECODE_ATTN_VERIFY_MAX_LOGS="${DECODE_ATTN_VERIFY_MAX_LOGS:-1000000}"
@@ -90,7 +89,10 @@ build_prefill_side_channel_ports() {
 launch_in_new_session() {
     local log_file="$1"
     shift
-    setsid "$@" >"${log_file}" 2>&1 &
+    # Run in background. Bash automatically puts background jobs in their
+    # own process group (PGID == PID), so `kill -- -$PID` in cleanup()
+    # reaches the entire process tree (nsys → vllm → workers).
+    "$@" >"${log_file}" 2>&1 &
     PIDS+=("$!")
 }
 
@@ -352,7 +354,6 @@ Prefill-DP 2P2D Disaggregated Serving Configuration
   Benchmark enabled: ${RUN_BENCHMARK}
   ShareGPT dataset: ${SHAREGPT_DATASET_PATH}
   Logs: ${LOG_DIR}
-  Step profiler dir: ${STEP_PROFILER_DIR}
   Coordinator log: ${LOG_DIR}/dp_coordinator.log
   Decode attention nsys: ${DECODE_ATTN_NSYS}
   Decode attention verify: ${DECODE_ATTN_VERIFY}
@@ -385,7 +386,6 @@ launch_prefill_dp_servers() {
     echo "Starting prefill internal-LB server: GPUs=${PREFILL_DP_GPUS}, api_port=${api_port}, side_channel_base_port=${PREFILL_DP_NIXL_SIDE_CHANNEL_BASE_PORT}"
     launch_in_new_session "${LOG_DIR}/prefill_internal_lb.log" \
         env \
-        VLLM_STEP_PROFILER_OUTPUT="${STEP_PROFILER_DIR}/prefill_internal_lb.csv" \
         VLLM_ENGINE_READY_TIMEOUT_S="${TIMEOUT_SECONDS}" \
         VLLM_DP_COORDINATOR_TRACE="${DP_COORDINATOR_TRACE}" \
         VLLM_DP_COORDINATOR_LOG_PATH="${LOG_DIR}/dp_coordinator.log" \
@@ -433,7 +433,6 @@ launch_decode_servers() {
         if [[ "${DECODE_ATTN_NSYS}" == "1" ]]; then
             launch_in_new_session "${LOG_DIR}/decode$((i + 1)).log" \
                 env \
-                VLLM_STEP_PROFILER_OUTPUT="${STEP_PROFILER_DIR}/decode$((i + 1)).csv" \
                 VLLM_ENGINE_READY_TIMEOUT_S="${TIMEOUT_SECONDS}" \
                 UCX_NET_DEVICES="${UCX_NET_DEVICES}" \
                 UCX_TLS="${UCX_TLS}" \
@@ -468,7 +467,6 @@ launch_decode_servers() {
         else
             launch_in_new_session "${LOG_DIR}/decode$((i + 1)).log" \
                 env \
-                VLLM_STEP_PROFILER_OUTPUT="${STEP_PROFILER_DIR}/decode$((i + 1)).csv" \
                 VLLM_ENGINE_READY_TIMEOUT_S="${TIMEOUT_SECONDS}" \
                 UCX_NET_DEVICES="${UCX_NET_DEVICES}" \
                 UCX_TLS="${UCX_TLS}" \
@@ -527,7 +525,6 @@ run_sharegpt_benchmark() {
 main() {
     trap cleanup EXIT INT TERM
     mkdir -p "${LOG_DIR}"
-    mkdir -p "${STEP_PROFILER_DIR}"
 
     check_required_files
     ensure_python_module_installed msgpack
