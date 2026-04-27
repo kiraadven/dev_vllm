@@ -3,6 +3,7 @@
 
 import functools
 import gc
+import os
 import itertools
 import threading
 import time
@@ -47,6 +48,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import (
     BatchDescriptor,
+    get_forward_context,
     set_forward_context,
 )
 from vllm.logger import init_logger
@@ -4032,6 +4034,36 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            # Expose batch req_ids and worker rank to the forward context
+            # so model-level instrumentation (e.g. NVTX annotations in
+            # qwen2_moe) can identify individual requests.
+            _fwd_ctx = get_forward_context()
+            _fwd_ctx.additional_kwargs["req_ids"] = req_ids
+            # In PD-disaggregated serving each decode instance is a
+            # standalone vllm serve (TP=1, world_size=1) so
+            # torch.distributed rank is always 0.  Let the launch script
+            # communicate a meaningful instance id via env var.
+            _fwd_ctx.additional_kwargs["worker_rank"] = int(
+                os.environ.get(
+                    "VLLM_INSTANCE_ID",
+                    str(
+                        torch.distributed.get_rank()
+                        if torch.distributed.is_initialized()
+                        else 0
+                    ),
+                )
+            )
+            _fwd_ctx.additional_kwargs["worker_local_rank"] = int(
+                os.environ.get(
+                    "VLLM_INSTANCE_LOCAL_ID",
+                    str(
+                        self.device.index
+                        if self.device.index is not None
+                        else 0
+                    ),
+                )
+            )
+
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,

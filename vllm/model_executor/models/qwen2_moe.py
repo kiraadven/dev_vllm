@@ -90,6 +90,46 @@ _DECODE_ATTN_NVTX_STEP_COUNTER = 0
 _DECODE_ATTN_VERIFY_LOG_COUNTER = 0
 
 
+def _infer_decode_counts(
+    attn_metadata: Any,
+) -> tuple[int, int, int]:
+    """Return (num_decodes, num_decode_tokens, num_prefill_tokens).
+
+    Works across all attention-metadata flavours:
+    * FlashInfer / ROCm Aiter: have ``num_decodes``, ``num_decode_tokens``,
+      ``num_prefill_tokens`` attributes directly.
+    * FlashAttention (V1, NVIDIA): these attributes are absent.  We fall back
+      to ``query_start_loc`` (cumulative query lengths per request) and count
+      requests whose query length is exactly 1 as decode requests.
+    """
+    # Fast path: metadata already carries the fields (FlashInfer, ROCm Aiter).
+    nd = getattr(attn_metadata, "num_decodes", None)
+    ndt = getattr(attn_metadata, "num_decode_tokens", None)
+    npt = getattr(attn_metadata, "num_prefill_tokens", None)
+    if nd is not None and ndt is not None and npt is not None:
+        return int(nd), int(ndt), int(npt)
+
+    # Slow path: derive from query_start_loc (FlashAttention V1).
+    query_start_loc = getattr(attn_metadata, "query_start_loc", None)
+    if query_start_loc is not None and query_start_loc.numel() > 1:
+        qsl = query_start_loc
+        if qsl.device.type != "cpu":
+            qsl = qsl.cpu()
+        query_lens = (qsl[1:] - qsl[:-1]).tolist()
+        num_decodes = 0
+        num_decode_tokens = 0
+        num_prefill_tokens = 0
+        for qlen in query_lens:
+            if qlen == 1:
+                num_decodes += 1
+                num_decode_tokens += 1
+            else:
+                num_prefill_tokens += qlen
+        return num_decodes, num_decode_tokens, num_prefill_tokens
+
+    return 0, 0, 0
+
+
 def _decode_attn_nvtx_enabled() -> bool:
     return bool(int(os.getenv(_DECODE_ATTN_NVTX_ENABLE_ENV, "1")))
 
@@ -165,6 +205,20 @@ def _extract_decode_request_keys(
             return request_keys[:num_decodes], f"forward_context.{key}"
 
     return [f"batch_pos_{idx}" for idx in range(num_decodes)], "batch_position_fallback"
+
+
+def _get_worker_rank(additional_kwargs: dict[str, Any]) -> str:
+    rank = additional_kwargs.get("worker_rank")
+    if rank is not None:
+        return str(rank)
+    return os.getenv("RANK", "na")
+
+
+def _get_worker_local_rank(additional_kwargs: dict[str, Any]) -> str:
+    local_rank = additional_kwargs.get("worker_local_rank")
+    if local_rank is not None:
+        return str(local_rank)
+    return os.getenv("LOCAL_RANK", "na")
 
 
 def _format_nvtx_list(values: list[Any], *, limit: int = 16) -> str:
@@ -259,8 +313,8 @@ def _maybe_log_decode_attn_condition(
         "request_keys=%s query_lens=%s seq_lens=%s",
         layer_idx,
         layer_name,
-        os.getenv("RANK", "na"),
-        os.getenv("LOCAL_RANK", "na"),
+        _get_worker_rank(forward_context.additional_kwargs),
+        _get_worker_local_rank(forward_context.additional_kwargs),
         condition_met,
         num_prefill_tokens,
         num_decode_tokens,
@@ -288,12 +342,14 @@ def _build_decode_attn_nvtx_label(
     query_lens = batch_info["query_lens"]
     seq_lens = batch_info["seq_lens"]
     step_idx = _next_decode_attn_step(forward_context)
+    rank = _get_worker_rank(forward_context.additional_kwargs)
+    local_rank = _get_worker_local_rank(forward_context.additional_kwargs)
     return (
         f"decode_attn"
         f" step={step_idx}"
         f" layer={layer_idx}"
-        f" rank={os.getenv('RANK', 'na')}"
-        f" local_rank={os.getenv('LOCAL_RANK', 'na')}"
+        f" rank={rank}"
+        f" local_rank={local_rank}"
         f" num_reqs={num_decodes}"
         f" num_tokens={num_decode_tokens}"
         f" req_key_kind={request_key_kind}"
@@ -527,9 +583,9 @@ class Qwen2MoeAttention(nn.Module):
             attn_metadata = forward_context.attn_metadata
             if isinstance(attn_metadata, dict):
                 attn_metadata = attn_metadata.get(self.attn.layer_name)
-            num_prefill_tokens = getattr(attn_metadata, "num_prefill_tokens", 0)
-            num_decode_tokens = getattr(attn_metadata, "num_decode_tokens", 0)
-            num_decodes = getattr(attn_metadata, "num_decodes", 0)
+            num_decodes, num_decode_tokens, num_prefill_tokens = (
+                _infer_decode_counts(attn_metadata)
+            )
             _maybe_log_decode_attn_condition(
                 forward_context=forward_context,
                 attn_metadata=attn_metadata,

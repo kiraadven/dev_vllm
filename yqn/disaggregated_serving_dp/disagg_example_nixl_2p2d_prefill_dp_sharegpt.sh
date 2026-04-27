@@ -395,6 +395,8 @@ launch_decode_servers() {
                 VLLM_QWEN2MOE_DECODE_ATTN_NVTX="1" \
                 VLLM_QWEN2MOE_DECODE_ATTN_VERIFY="${DECODE_ATTN_VERIFY}" \
                 VLLM_QWEN2MOE_DECODE_ATTN_VERIFY_MAX_LOGS="${DECODE_ATTN_VERIFY_MAX_LOGS}" \
+                VLLM_INSTANCE_ID="${i}" \
+                VLLM_INSTANCE_LOCAL_ID="${gpu_id}" \
                 CUDA_VISIBLE_DEVICES="${gpu_id}" \
                 "${NSYS_BIN}" profile \
                 --trace "${DECODE_ATTN_NSYS_TRACE}" \
@@ -427,6 +429,8 @@ launch_decode_servers() {
                 VLLM_QWEN2MOE_DECODE_ATTN_NVTX="0" \
                 VLLM_QWEN2MOE_DECODE_ATTN_VERIFY="${DECODE_ATTN_VERIFY}" \
                 VLLM_QWEN2MOE_DECODE_ATTN_VERIFY_MAX_LOGS="${DECODE_ATTN_VERIFY_MAX_LOGS}" \
+                VLLM_INSTANCE_ID="${i}" \
+                VLLM_INSTANCE_LOCAL_ID="${gpu_id}" \
                 CUDA_VISIBLE_DEVICES="${gpu_id}" \
                 "${VLLM_BIN}" serve "${MODEL}" \
                 --enforce-eager \

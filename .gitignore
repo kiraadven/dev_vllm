@@ -109,7 +109,7 @@ ipython_config.py
 # uv
 uv.lock
 
-*.nsys_rep
+*.nsys-rep
 *.sqlite
 
 # pyenv
