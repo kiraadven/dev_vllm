@@ -33,7 +33,7 @@ import numpy as np
 
 from base_dataset import DatasetAnalyzer
 
-_DEFAULT_JSONL = Path("/data/yqn/ShareGPT-X/ChatGPT-Simple.jsonl")
+_DEFAULT_JSONL = Path("/data/yqn/datasets/ShareGPT-X/ChatGPT-Simple.jsonl")
 
 _TS_MIN = datetime.datetime(2024, 1,  1, tzinfo=datetime.timezone.utc).timestamp()
 _TS_MAX = datetime.datetime(2025, 8, 31, tzinfo=datetime.timezone.utc).timestamp()
