@@ -1290,7 +1290,7 @@ class EngineCoreProc(EngineCore):
         self, request_type: EngineCoreRequestType, request: Any
     ) -> None:
         """Dispatch request from client."""
-
+        # HACK：这里的分发逻辑可以上移到sheduler内部，而不是让每一个engine自己接管
         if request_type == EngineCoreRequestType.WAKEUP:
             return
         elif request_type == EngineCoreRequestType.ADD:

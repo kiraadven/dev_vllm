@@ -168,7 +168,7 @@ class KVCacheEvictionEvent:
 
 
 @dataclass
-class SchedulerStats:
+class SchedulerStats: # HACK: 这里要注意，集结了sheduler的信息，要把全局的信息都加入到这个里面
     """Stats associated with the scheduler."""
 
     num_running_reqs: int = 0

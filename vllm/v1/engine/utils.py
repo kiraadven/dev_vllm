@@ -1031,7 +1031,7 @@ def launch_core_engines(
     # 2. MoE models: wave coordination in addition to stats
     run_coordinator = (
         vllm_config.needs_dp_coordinator and not offline_mode and dp_rank == 0
-    )
+    ) # HACK: 考虑一下把这个coordinator集成到全局scheduler内部
 
     if run_coordinator:
         coordinator = DPCoordinator(

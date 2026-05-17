@@ -25,7 +25,9 @@
 # limitations under the License.
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 
+import os
 from collections.abc import Iterable
+from contextlib import contextmanager, nullcontext
 from itertools import islice
 from typing import Any
 
@@ -37,13 +39,11 @@ from transformers import Qwen2MoeConfig
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.fused_moe import (
-    FusedMoE,
-    fused_moe_make_expert_params_mapping,
-)
+from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -72,6 +72,304 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+_DECODE_ATTN_NVTX_ENABLE_ENV = "VLLM_QWEN2MOE_DECODE_ATTN_NVTX"
+_DECODE_ATTN_VERIFY_ENV = "VLLM_QWEN2MOE_DECODE_ATTN_VERIFY"
+_DECODE_ATTN_VERIFY_MAX_LOGS_ENV = (
+    "VLLM_QWEN2MOE_DECODE_ATTN_VERIFY_MAX_LOGS"
+)
+_DECODE_ATTN_NVTX_BATCH_INFO_KEY = "_qwen2_moe_decode_attn_nvtx_batch_info"
+_DECODE_ATTN_NVTX_STEP_KEY = "_qwen2_moe_decode_attn_nvtx_step"
+_DECODE_ATTN_NVTX_REQUEST_ID_KEYS = (
+    "req_ids",
+    "request_ids",
+    "request_ids_output_copy",
+    "scheduled_req_ids",
+)
+_DECODE_ATTN_NVTX_STEP_COUNTER = 0
+_DECODE_ATTN_VERIFY_LOG_COUNTER = 0
+
+
+def _infer_decode_counts(
+    attn_metadata: Any,
+) -> tuple[int, int, int]:
+    """Return (num_decodes, num_decode_tokens, num_prefill_tokens).
+
+    Works across all attention-metadata flavours:
+    * FlashInfer / ROCm Aiter: have ``num_decodes``, ``num_decode_tokens``,
+      ``num_prefill_tokens`` attributes directly.
+    * FlashAttention (V1, NVIDIA): these attributes are absent.  We fall back
+      to ``query_start_loc`` (cumulative query lengths per request) and count
+      requests whose query length is exactly 1 as decode requests.
+    """
+    # Fast path: metadata already carries the fields (FlashInfer, ROCm Aiter).
+    nd = getattr(attn_metadata, "num_decodes", None)
+    ndt = getattr(attn_metadata, "num_decode_tokens", None)
+    npt = getattr(attn_metadata, "num_prefill_tokens", None)
+    if nd is not None and ndt is not None and npt is not None:
+        return int(nd), int(ndt), int(npt)
+
+    # Slow path: derive from query_start_loc (FlashAttention V1).
+    query_start_loc = getattr(attn_metadata, "query_start_loc", None)
+    if query_start_loc is not None and query_start_loc.numel() > 1:
+        qsl = query_start_loc
+        if qsl.device.type != "cpu":
+            qsl = qsl.cpu()
+        query_lens = (qsl[1:] - qsl[:-1]).tolist()
+        num_decodes = 0
+        num_decode_tokens = 0
+        num_prefill_tokens = 0
+        for qlen in query_lens:
+            if qlen == 1:
+                num_decodes += 1
+                num_decode_tokens += 1
+            else:
+                num_prefill_tokens += qlen
+        return num_decodes, num_decode_tokens, num_prefill_tokens
+
+    return 0, 0, 0
+
+
+def _decode_attn_nvtx_enabled() -> bool:
+    return bool(int(os.getenv(_DECODE_ATTN_NVTX_ENABLE_ENV, "1")))
+
+
+def _decode_attn_verify_enabled() -> bool:
+    return bool(int(os.getenv(_DECODE_ATTN_VERIFY_ENV, "0")))
+
+
+def _decode_attn_verify_max_logs() -> int:
+    try:
+        return max(0, int(os.getenv(_DECODE_ATTN_VERIFY_MAX_LOGS_ENV, "50")))
+    except ValueError:
+        return 50
+
+
+def _slice_int_list(values: Any, limit: int) -> list[int]:
+    if values is None:
+        return []
+    if torch.is_tensor(values):
+        tensor = values[:limit]
+        if tensor.device.type != "cpu":
+            tensor = tensor.to("cpu")
+        return [int(value) for value in tensor.tolist()]
+    if hasattr(values, "tolist"):
+        return [int(value) for value in values.tolist()[:limit]]
+    return [int(value) for value in islice(values, limit)]
+
+
+def _extract_decode_query_lens(
+    attn_metadata: Any,
+    num_decodes: int,
+    num_decode_tokens: int,
+) -> list[int]:
+    query_start_loc_cpu = getattr(attn_metadata, "query_start_loc_cpu", None)
+    if query_start_loc_cpu is not None:
+        query_start_locs = _slice_int_list(query_start_loc_cpu, num_decodes + 1)
+        if len(query_start_locs) == num_decodes + 1:
+            query_lens = [
+                query_start_locs[idx + 1] - query_start_locs[idx]
+                for idx in range(num_decodes)
+            ]
+            if sum(query_lens) == num_decode_tokens:
+                return query_lens
+
+    if num_decodes <= 0:
+        return []
+    base, remainder = divmod(num_decode_tokens, num_decodes)
+    return [base + (1 if idx < remainder else 0) for idx in range(num_decodes)]
+
+
+def _extract_decode_seq_lens(attn_metadata: Any, num_decodes: int) -> list[int]:
+    seq_lens = _slice_int_list(getattr(attn_metadata, "seq_lens_cpu", None), num_decodes)
+    if len(seq_lens) == num_decodes:
+        return seq_lens
+    return _slice_int_list(getattr(attn_metadata, "seq_lens", None), num_decodes)
+
+
+def _extract_decode_request_keys(
+    additional_kwargs: dict[str, Any], num_decodes: int
+) -> tuple[list[str], str]:
+    if num_decodes <= 0:
+        return [], "none"
+
+    for key in _DECODE_ATTN_NVTX_REQUEST_ID_KEYS:
+        value = additional_kwargs.get(key)
+        if isinstance(value, dict):
+            request_keys = [str(req_id) for req_id in value.keys()]
+        elif isinstance(value, (list, tuple)):
+            request_keys = [str(req_id) for req_id in value]
+        else:
+            continue
+        if len(request_keys) >= num_decodes:
+            return request_keys[:num_decodes], f"forward_context.{key}"
+
+    return [f"batch_pos_{idx}" for idx in range(num_decodes)], "batch_position_fallback"
+
+
+def _get_worker_rank(additional_kwargs: dict[str, Any]) -> str:
+    rank = additional_kwargs.get("worker_rank")
+    if rank is not None:
+        return str(rank)
+    return os.getenv("RANK", "na")
+
+
+def _get_worker_local_rank(additional_kwargs: dict[str, Any]) -> str:
+    local_rank = additional_kwargs.get("worker_local_rank")
+    if local_rank is not None:
+        return str(local_rank)
+    return os.getenv("LOCAL_RANK", "na")
+
+
+def _format_nvtx_list(values: list[Any], *, limit: int = 16) -> str:
+    shown = [str(value) for value in values[:limit]]
+    if len(values) > limit:
+        shown.append("...")
+    return "[" + ",".join(shown) + "]"
+
+
+def _next_decode_attn_step(forward_context: Any) -> int:
+    global _DECODE_ATTN_NVTX_STEP_COUNTER
+    step_idx = forward_context.additional_kwargs.get(_DECODE_ATTN_NVTX_STEP_KEY)
+    if isinstance(step_idx, int):
+        return step_idx
+    _DECODE_ATTN_NVTX_STEP_COUNTER += 1
+    step_idx = _DECODE_ATTN_NVTX_STEP_COUNTER
+    forward_context.additional_kwargs[_DECODE_ATTN_NVTX_STEP_KEY] = step_idx
+    return step_idx
+
+
+def _get_decode_attn_batch_info(
+    forward_context: Any,
+    attn_metadata: Any,
+    num_decodes: int,
+    num_decode_tokens: int,
+) -> dict[str, Any]:
+    batch_info = forward_context.additional_kwargs.get(_DECODE_ATTN_NVTX_BATCH_INFO_KEY)
+    if (
+        isinstance(batch_info, dict)
+        and batch_info.get("num_decodes") == num_decodes
+        and batch_info.get("num_decode_tokens") == num_decode_tokens
+    ):
+        return batch_info
+
+    batch_info = {
+        "num_decodes": num_decodes,
+        "num_decode_tokens": num_decode_tokens,
+        "request_keys": _extract_decode_request_keys(
+            forward_context.additional_kwargs, num_decodes
+        ),
+        "query_lens": _extract_decode_query_lens(
+            attn_metadata, num_decodes, num_decode_tokens
+        ),
+        "seq_lens": _extract_decode_seq_lens(attn_metadata, num_decodes),
+    }
+    forward_context.additional_kwargs[_DECODE_ATTN_NVTX_BATCH_INFO_KEY] = batch_info
+    return batch_info
+
+
+def _maybe_log_decode_attn_condition(
+    *,
+    forward_context: Any,
+    attn_metadata: Any,
+    layer_idx: int,
+    layer_name: str,
+    num_prefill_tokens: int,
+    num_decode_tokens: int,
+    num_decodes: int,
+) -> None:
+    global _DECODE_ATTN_VERIFY_LOG_COUNTER
+
+    if not _decode_attn_verify_enabled():
+        return
+
+    condition_met = (
+        num_prefill_tokens == 0 and num_decode_tokens > 0 and num_decodes > 0
+    )
+    if condition_met and layer_idx != 0:
+        return
+
+    if _DECODE_ATTN_VERIFY_LOG_COUNTER >= _decode_attn_verify_max_logs():
+        return
+    _DECODE_ATTN_VERIFY_LOG_COUNTER += 1
+
+    request_keys = []
+    request_key_kind = "na"
+    query_lens = []
+    seq_lens = []
+    if num_decodes > 0:
+        batch_info = _get_decode_attn_batch_info(
+            forward_context, attn_metadata, num_decodes, num_decode_tokens
+        )
+        request_keys, request_key_kind = batch_info["request_keys"]
+        query_lens = batch_info["query_lens"]
+        seq_lens = batch_info["seq_lens"]
+
+    log_fn = logger.info if condition_met else logger.warning
+    log_fn(
+        "qwen2_moe decode-attn verify layer=%s layer_name=%s rank=%s "
+        "local_rank=%s condition_met=%s num_prefill_tokens=%s "
+        "num_decode_tokens=%s num_decodes=%s request_key_kind=%s "
+        "request_keys=%s query_lens=%s seq_lens=%s",
+        layer_idx,
+        layer_name,
+        _get_worker_rank(forward_context.additional_kwargs),
+        _get_worker_local_rank(forward_context.additional_kwargs),
+        condition_met,
+        num_prefill_tokens,
+        num_decode_tokens,
+        num_decodes,
+        request_key_kind,
+        request_keys,
+        query_lens,
+        seq_lens,
+    )
+
+
+def _build_decode_attn_nvtx_label(
+    *,
+    forward_context: Any,
+    attn_metadata: Any,
+    layer_idx: int,
+    layer_name: str,
+    num_decodes: int,
+    num_decode_tokens: int,
+) -> str:
+    batch_info = _get_decode_attn_batch_info(
+        forward_context, attn_metadata, num_decodes, num_decode_tokens
+    )
+    request_keys, request_key_kind = batch_info["request_keys"]
+    query_lens = batch_info["query_lens"]
+    seq_lens = batch_info["seq_lens"]
+    step_idx = _next_decode_attn_step(forward_context)
+    rank = _get_worker_rank(forward_context.additional_kwargs)
+    local_rank = _get_worker_local_rank(forward_context.additional_kwargs)
+    return (
+        f"decode_attn"
+        f" step={step_idx}"
+        f" layer={layer_idx}"
+        f" rank={rank}"
+        f" local_rank={local_rank}"
+        f" num_reqs={num_decodes}"
+        f" num_tokens={num_decode_tokens}"
+        f" req_key_kind={request_key_kind}"
+        f" layer_name={layer_name}"
+        f" req_keys={_format_nvtx_list(request_keys)}"
+        f" qlens={_format_nvtx_list(query_lens)}"
+        f" slens={_format_nvtx_list(seq_lens)}"
+    )
+
+
+@contextmanager
+def _decode_attn_nvtx_range(label: str):
+    if not torch.cuda.is_available() or not hasattr(torch.cuda, "nvtx"):
+        yield
+        return
+    torch.cuda.nvtx.range_push(label)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
 
 
 class Qwen2MoeMLP(nn.Module):
@@ -207,6 +505,7 @@ class Qwen2MoeAttention(nn.Module):
         dual_chunk_attention_config: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
+        self.layer_idx = extract_layer_index(prefix)
         self.hidden_size = hidden_size
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
@@ -277,7 +576,39 @@ class Qwen2MoeAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v)
+        attn_context = nullcontext()
+        if ((_decode_attn_nvtx_enabled() or _decode_attn_verify_enabled())
+                and is_forward_context_available()):
+            forward_context = get_forward_context()
+            attn_metadata = forward_context.attn_metadata
+            if isinstance(attn_metadata, dict):
+                attn_metadata = attn_metadata.get(self.attn.layer_name)
+            num_decodes, num_decode_tokens, num_prefill_tokens = (
+                _infer_decode_counts(attn_metadata)
+            )
+            _maybe_log_decode_attn_condition(
+                forward_context=forward_context,
+                attn_metadata=attn_metadata,
+                layer_idx=self.layer_idx,
+                layer_name=self.attn.layer_name,
+                num_prefill_tokens=num_prefill_tokens,
+                num_decode_tokens=num_decode_tokens,
+                num_decodes=num_decodes,
+            )
+            if (_decode_attn_nvtx_enabled() and num_prefill_tokens == 0
+                    and num_decode_tokens > 0 and num_decodes > 0):
+                attn_context = _decode_attn_nvtx_range(
+                    _build_decode_attn_nvtx_label(
+                        forward_context=forward_context,
+                        attn_metadata=attn_metadata,
+                        layer_idx=self.layer_idx,
+                        layer_name=self.attn.layer_name,
+                        num_decodes=num_decodes,
+                        num_decode_tokens=num_decode_tokens,
+                    )
+                )
+        with attn_context:
+            attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -421,7 +752,7 @@ class Qwen2MoeModel(nn.Module):
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        return fused_moe_make_expert_params_mapping(
+        return FusedMoE.make_expert_params_mapping(
             self,
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",

@@ -1164,6 +1164,7 @@ class DPAsyncMPClient(AsyncMPClient):
 
         self.eep_scaling_cache: ElasticScalingCache | None = None
 
+        # HACK：这里可能也要修改
         self.first_req_sock_addr = get_open_zmq_inproc_path()
         self.first_req_send_socket = self.resources.first_req_send_socket = (
             make_zmq_socket(self.ctx, self.first_req_sock_addr, zmq.PAIR, bind=True)
@@ -1186,7 +1187,7 @@ class DPAsyncMPClient(AsyncMPClient):
         assert len(self.engine_ranks_managed) > 0
 
         async def run_engine_stats_update_task():
-            with (
+            with ( # HACK: 这里也可以注意 全局sheduler或许也可以直接复用coordinator的socket
                 make_zmq_socket(self.ctx, stats_addr, zmq.XSUB, linger=0) as socket,
                 make_zmq_socket(
                     self.ctx, self.first_req_sock_addr, zmq.PAIR, bind=False, linger=0

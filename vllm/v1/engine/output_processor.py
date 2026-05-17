@@ -587,7 +587,7 @@ class OutputProcessor:
             * If there is a queue (for usage with AsyncLLM),
               put the RequestOutput objects into the queue for
               handling by the per-request generate() tasks.
-
+            # HACK：这里说清楚了把request放入RequestOutput 的queue里面会有每一个request的generate
             * If there is no queue (for usage with LLMEngine),
               return a list of RequestOutput objects.
 
