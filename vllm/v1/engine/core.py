@@ -451,6 +451,15 @@ class EngineCore:
             scheduler_output, model_output
         )
 
+        # DP-DCP global scheduler: push per-step stats (no-op if disabled).
+        try:
+            from yqn.dp_dcp_global_scheduler.src.engine_integration import (
+                maybe_report_step,
+            )
+            maybe_report_step(self, scheduler_output)
+        except Exception:
+            logger.exception("DP-DCP report_step failed")
+
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
     def post_step(self, model_executed: bool) -> None:
@@ -940,6 +949,17 @@ class EngineCoreProc(EngineCore):
                     raise RuntimeError("Input socket thread died during startup")
                 assert addresses.coordinator_input is not None
                 logger.info("Waiting for READY message from DP Coordinator...")
+
+        # DP-DCP global scheduler integration (no-op unless env is set).
+        try:
+            from yqn.dp_dcp_global_scheduler.src.engine_integration import (
+                maybe_install_attention_patch,
+                maybe_install_engine_adapter,
+            )
+            maybe_install_attention_patch(vllm_config)
+            maybe_install_engine_adapter(self)
+        except Exception:
+            logger.exception("DP-DCP global scheduler integration failed")
 
     @contextmanager
     def _perform_handshakes(

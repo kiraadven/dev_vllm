@@ -1,0 +1,23 @@
+# Decode rank LMCache config.
+#
+# Role: receiver. NIXL receive buffer is in host DRAM (not CUDA) so that:
+#   - prefill->decode RDMA writes go to DRAM
+#   - GPU paged-buffer prefetch is layer-wise via cudaMemcpyAsync on PCIe,
+#     freeing NVLink for cross-DP attention collectives
+#   - DRAM also doubles as the tier-1 cache for evicted decode requests
+#
+# Sizing: nixl_buffer_size should fit a few outstanding handoffs worth of
+# full-prompt KV. max_local_cpu_size is the DRAM tier capacity.
+
+local_cpu: True
+max_local_cpu_size: 500000000000   # 500 GB DRAM tier
+max_local_disk_size: 0             # set if NVMe tier desired
+remote_serde: NULL
+
+enable_nixl: True
+nixl_role: "receiver"
+nixl_peer_host: "localhost"        # override per deployment
+nixl_peer_port: 55555
+nixl_buffer_size: 10737418240      # 10 GB receive staging
+nixl_buffer_device: "dram"         # KEY: receive into host DRAM, not GPU
+nixl_enable_gc: True
