@@ -1671,7 +1671,7 @@ def initialize_model_parallel(
     assert _EP is None, "expert parallel group is already initialized"
     # Don't create EP group for dense models.
     if config.model_config is None or config.model_config.is_moe:
-        group_ranks = (
+        group_ranks = ( # [ExternalDP, DP, PP, PCP, TP] -> [ExternalDP * PP, DP * PCP * TP]
             all_ranks.transpose(1, 2)
             .reshape(
                 -1,

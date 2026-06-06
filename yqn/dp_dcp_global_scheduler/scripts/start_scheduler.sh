@@ -1,19 +1,26 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Start the standalone GlobalScheduler process.
 # Front-ends and engines connect to the printed addresses.
 
-set -e
+set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJ_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-PY=/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/lifeng/qining/dev_vllm/.venv/bin/python
+ROOT_DIR="$(cd "$PROJ_DIR/../.." && pwd)"
+PYTHON_BIN="${PYTHON_BIN:-$ROOT_DIR/.venv/bin/python}"
 
-# 1 prefill rank (engine 0) + 4 decode ranks (engines 1..4) on a single
+if [[ ! -x "$PYTHON_BIN" ]]; then
+    echo "Missing Python executable: $PYTHON_BIN"
+    exit 1
+fi
+
+# 1 prefill rank (engine 0) + 3 decode ranks (engines 1..3) on a single
 # NUMA half (GPU 0..3 are NV4+PIX; GPU 4..7 likewise on the other NUMA).
-ENGINES=5
-ROLES="prefill,decode,decode,decode,decode"
+ENGINES="${ENGINES:-4}"
+ROLES="${ROLES:-prefill,decode,decode,decode}"
 
 cd "$PROJ_DIR"
-exec $PY -m src.global_scheduler \
+export PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}"
+exec "$PYTHON_BIN" -m src.global_scheduler \
     --engines "$ENGINES" \
     --roles "$ROLES" \
     --front-addr "tcp://*:5570" \
