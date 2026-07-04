@@ -52,6 +52,10 @@ from vllm.benchmarks.lib.endpoint_request_func import (
 from vllm.benchmarks.lib.ready_checker import wait_for_endpoint
 from vllm.benchmarks.lib.utils import convert_to_pytorch_benchmark_format, write_to_json
 from vllm.tokenizers import TokenizerLike, get_tokenizer
+from vllm.v1.metrics.expert_kv_contention import (
+    is_summary_enabled,
+    summarize_trace_file,
+)
 from vllm.utils.gc_utils import freeze_gc_heap
 from vllm.utils.network_utils import join_host_port
 
@@ -1886,6 +1890,11 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
 
     # Merge with benchmark result
     result_json = {**result_json, **benchmark_result}
+
+    if is_summary_enabled():
+        expert_kv_summary = summarize_trace_file()
+        if expert_kv_summary is not None:
+            result_json["expert_kv_contention"] = expert_kv_summary
 
     # Compute file_name once before using it for plots or saving results
     file_name = compute_result_filename(args, model_id, label, current_dt)

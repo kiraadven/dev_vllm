@@ -44,6 +44,11 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
     get_kv_quant_mode,
 )
+from vllm.v1.metrics.expert_kv_contention import (
+    end_cuda_timing,
+    get_profiler,
+    start_cuda_timing,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention import MLAAttention
@@ -487,6 +492,7 @@ class Attention(nn.Module, AttentionLayerBase):
         if value is not None:
             value = value.view(-1, self.num_kv_heads, self.head_size_v)
         kv_cache_dummy_dep = None
+        timing = start_cuda_timing()
         if self.use_direct_call:
             # Skip this if sharing KV cache with an earlier attention layer.
             if (
@@ -525,6 +531,17 @@ class Attention(nn.Module, AttentionLayerBase):
                 output,
                 encoded,
                 kv_cache_dummy_dep=kv_cache_dummy_dep,
+            )
+        timing = end_cuda_timing(timing)
+        if timing is not None:
+            start_event, end_event = timing
+            get_profiler().record_timeline_event(
+                event="attention_compute",
+                lane="compute",
+                layer_name=self.layer_name,
+                layer_id=None,
+                start_event=start_event,
+                end_event=end_event,
             )
         return output.view(-1, hidden_size)
 

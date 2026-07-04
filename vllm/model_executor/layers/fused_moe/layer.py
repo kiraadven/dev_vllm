@@ -57,6 +57,12 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
 from vllm.platforms import current_platform
+from vllm.v1.metrics.expert_kv_contention import (
+    end_cuda_timing,
+    get_profiler,
+    has_active_forward,
+    start_cuda_timing,
+)
 
 logger = init_logger(__name__)
 
@@ -1308,11 +1314,36 @@ class FusedMoE(PluggableLayer):
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.runner.forward(
+        extra = None
+        if has_active_forward() and not torch.cuda.is_current_stream_capturing():
+            _, routed_experts = router_logits.topk(self.top_k, dim=-1)
+            active_expert_count = routed_experts.unique().numel()
+            extra = {
+                "active_expert_count": active_expert_count,
+                "total_expert_count": self.global_num_experts,
+                "active_expert_ratio": active_expert_count
+                / self.global_num_experts,
+            }
+
+        timing = start_cuda_timing()
+        output = self.runner.forward(
             hidden_states,
             router_logits,
             input_ids,
         )
+        timing = end_cuda_timing(timing)
+        if timing is not None:
+            start_event, end_event = timing
+            get_profiler().record_timeline_event(
+                event="moe_compute",
+                lane="compute",
+                layer_name=self.layer_name,
+                layer_id=self.layer_id,
+                start_event=start_event,
+                end_event=end_event,
+                extra=extra,
+            )
+        return output
 
     @property
     def expert_map(self) -> torch.Tensor | None:

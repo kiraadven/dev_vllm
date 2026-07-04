@@ -6,7 +6,9 @@ pynvml. However, it should not initialize cuda context.
 
 from __future__ import annotations
 
+import importlib.util
 import os
+import sys
 from collections.abc import Callable
 from datetime import timedelta
 from functools import cache, lru_cache, wraps
@@ -18,8 +20,20 @@ from torch.distributed.distributed_c10d import is_nccl_available
 from typing_extensions import ParamSpec
 
 # import custom ops, trigger op registration
-import vllm._C  # noqa
-import vllm._C_stable_libtorch  # noqa
+_stable_ext_path = os.environ.get("VLLM_STABLE_EXT_PATH")
+if _stable_ext_path:
+    _stable_ext_spec = importlib.util.spec_from_file_location(
+        "vllm._C_stable_libtorch", _stable_ext_path
+    )
+    if _stable_ext_spec is None or _stable_ext_spec.loader is None:
+        raise ImportError(
+            f"Cannot load vllm._C_stable_libtorch from {_stable_ext_path}"
+        )
+    _stable_ext_module = importlib.util.module_from_spec(_stable_ext_spec)
+    sys.modules["vllm._C_stable_libtorch"] = _stable_ext_module
+    _stable_ext_spec.loader.exec_module(_stable_ext_module)
+else:
+    import vllm._C_stable_libtorch  # noqa
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.utils.import_utils import import_pynvml

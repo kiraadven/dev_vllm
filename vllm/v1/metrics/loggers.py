@@ -18,6 +18,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 from vllm.logger import init_logger
 from vllm.plugins import STAT_LOGGER_PLUGINS_GROUP, load_plugins_by_group
 from vllm.v1.engine import FinishReason
+from vllm.v1.metrics.expert_kv_contention import get_profiler
 from vllm.v1.metrics.perf import PerfMetricsLogging, PerfMetricsProm
 from vllm.v1.metrics.prometheus import unregister_vllm_metrics
 from vllm.v1.metrics.stats import (
@@ -192,6 +193,17 @@ class LoggingStatLogger(StatLoggerBase):
                 self.perf_metrics_logging.observe(perf_stats)
         if mm_cache_stats:
             self.mm_caching_metrics.observe(mm_cache_stats)
+
+        profiler = get_profiler()
+        profiler.record_scheduler_stats(
+            scheduler_stats=scheduler_stats,
+            iteration_stats=iteration_stats,
+            engine_idx=engine_idx,
+        )
+        profiler.record_request_final_stats(
+            iteration_stats=iteration_stats,
+            engine_idx=engine_idx,
+        )
 
     def _update_stats(self):
         now = time.monotonic()

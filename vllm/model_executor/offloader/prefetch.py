@@ -22,6 +22,12 @@ import vllm.model_executor.offloader.prefetch_ops  # noqa: F401
 from vllm.logger import init_logger
 from vllm.model_executor.offloader.base import BaseOffloader, should_pin_memory
 from vllm.utils.torch_utils import get_dtype_size
+from vllm.v1.metrics.expert_kv_contention import (
+    end_cuda_timing,
+    get_profiler,
+    has_active_forward,
+    start_cuda_timing,
+)
 
 logger = init_logger(__name__)
 
@@ -160,6 +166,28 @@ class PrefetchOffloader(BaseOffloader):
         self.buffer_pool: StaticBufferPool | None = None
         self.total_offloaded_bytes = 0
 
+    def get_expert_kv_contention_config(self) -> dict[str, Any]:
+        offload_ratio = None
+        if self.group_size:
+            offload_ratio = self.num_in_group / self.group_size
+
+        static_buffer_pool_bytes = 0
+        if self.buffer_pool is not None:
+            static_buffer_pool_bytes = self.buffer_pool.total_bytes
+
+        return {
+            "backend": "prefetch",
+            "group_size": self.group_size,
+            "num_in_group": self.num_in_group,
+            "offload_ratio": offload_ratio,
+            "prefetch_step": self.prefetch_step,
+            "mode": self.mode,
+            "offload_params": sorted(self.offload_params),
+            "offloaded_module_count": len(self.module_offloaders),
+            "total_offloaded_bytes": self.total_offloaded_bytes,
+            "static_buffer_pool_bytes": static_buffer_pool_bytes,
+        }
+
     def wrap_modules(
         self,
         modules_generator: Generator[nn.Module, None, None],
@@ -252,6 +280,8 @@ class PrefetchOffloader(BaseOffloader):
         2. We can't wait on pre-capture events during capture (isolation error)
         """
         offloader = self.module_offloaders[layer_idx]
+        timing = start_cuda_timing()
+        wait_kind = None
 
         if torch.cuda.is_current_stream_capturing():
             # During capture, skip wait for pre-capture prefetches.
@@ -259,6 +289,7 @@ class PrefetchOffloader(BaseOffloader):
             if not offloader._prefetch_in_capture:
                 return
             # Event-based wait for in-capture prefetches (graph-compatible)
+            wait_kind = "event_capture"
             torch.cuda.current_stream().wait_event(offloader._copy_done_event)
             # Mark that this prefetch has been waited on (joined).
             offloader._prefetch_in_capture = False
@@ -266,11 +297,26 @@ class PrefetchOffloader(BaseOffloader):
             if offloader._event_valid_for_eager:
                 # Use per-layer event to only wait for THIS layer's copy,
                 # allowing other layers' prefetches to run concurrently.
+                wait_kind = "event_eager"
                 torch.cuda.current_stream().wait_event(offloader._copy_done_event)
             else:
                 # Event not usable (unrecorded or recorded during capture).
                 # Fall back to wait_stream to drain all copy_stream work.
+                wait_kind = "stream_eager"
                 torch.cuda.current_stream().wait_stream(self.copy_stream)
+
+        timing = end_cuda_timing(timing)
+        if timing is not None:
+            start_event, end_event = timing
+            get_profiler().record_timeline_event(
+                event="prefetch_wait",
+                lane="compute",
+                layer_name=offloader.layer_name,
+                layer_id=offloader.layer_idx,
+                start_event=start_event,
+                end_event=end_event,
+                extra={"wait_kind": wait_kind},
+            )
 
     def sync_prev_onload(self):
         """Sync previous onload operations.
@@ -384,6 +430,7 @@ class _ModuleOffloader:
         self.device = next(module.parameters()).device
         self.copy_stream = copy_stream
         self.layer_idx = layer_idx
+        self.layer_name = getattr(module, "layer_name", None)
         self.offloaded_bytes = 0
 
         # Event to signal when H2D copy to static buffer is complete.
@@ -522,7 +569,18 @@ class _ModuleOffloader:
         torch.cuda.current_stream().record_event(fork_event)
         self.copy_stream.wait_event(fork_event)
 
+        copy_start_event = None
+        copy_end_event = None
+        record_copy_timing = (
+            has_active_forward() and not torch.cuda.is_current_stream_capturing()
+        )
+        if record_copy_timing:
+            copy_start_event = torch.cuda.Event(enable_timing=True)
+            copy_end_event = torch.cuda.Event(enable_timing=True)
+
         with torch.cuda.stream(self.copy_stream):
+            if copy_start_event is not None:
+                copy_start_event.record(self.copy_stream)
             for name, offloader in self._param_offloaders.items():
                 cpu_storage = offloader._cpu_storage
                 gpu_buffer = offloader._gpu_buffer
@@ -535,6 +593,19 @@ class _ModuleOffloader:
                     "event-based fork synchronization."
                 )
                 gpu_buffer.copy_(cpu_storage, non_blocking=True)
+            if copy_end_event is not None:
+                copy_end_event.record(self.copy_stream)
+
+        if copy_start_event is not None and copy_end_event is not None:
+            get_profiler().record_timeline_event(
+                event="h2d_comm",
+                lane="copy",
+                layer_name=self.layer_name,
+                layer_id=self.layer_idx,
+                start_event=copy_start_event,
+                end_event=copy_end_event,
+                extra={"copy_bytes": self.offloaded_bytes},
+            )
 
         # Record completion event for _wait_for_layer to use
         self._copy_done_event.record(self.copy_stream)
