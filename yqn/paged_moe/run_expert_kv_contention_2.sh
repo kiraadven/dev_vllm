@@ -9,7 +9,7 @@ VLLM_BIN="${VLLM_BIN:-${ROOT_DIR}/.venv/bin/vllm}"
 MODEL="${MODEL:-/data/yqn/Qwen1.5-MoE-A2.7B}"
 SHAREGPT_DATASET_PATH="${SHAREGPT_DATASET_PATH:-/data/yqn/datasets/ShareGPT-X/ChatGPT-Simple.vllm.json}"
 
-GPU_ID="${GPU_ID:-2}"
+GPU_ID="${GPU_ID:-6}"
 if [[ -z "${NUMA_NODE:-}" ]]; then
     if (( GPU_ID <= 3 )); then
         NUMA_NODE=0
@@ -18,15 +18,15 @@ if [[ -z "${NUMA_NODE:-}" ]]; then
     fi
 fi
 HOST="${HOST:-127.0.0.1}"
-PORT="${PORT:-8000}"
+PORT="${PORT:-8001}"
 BASE_URL="${BASE_URL:-http://${HOST}:${PORT}}"
 TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-1200}"
 SERVER_STOP_TIMEOUT="${SERVER_STOP_TIMEOUT:-30}"
 
 # RTX A6000 has ~48GiB HBM; Qwen1.5-MoE-A2.7B weights are ~27GiB.
-# 0.75 leaves R0 with limited KV headroom while making expert offload visibly
-# increase available KV cache capacity under the same total vLLM memory budget.
-GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.75}"
+# This second-run default uses NUMA node 1 and a lower memory budget to amplify
+# KV/expert HBM contention while avoiding the primary experiment's port/GPU.
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.65}"
 DTYPE="${DTYPE:-auto}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
